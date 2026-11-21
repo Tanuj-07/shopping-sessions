@@ -1824,9 +1824,15 @@ fn main() {
     // ------------------------------------------------------------ 5. sessions
     let camp_acc: Vec<Mutex<Vec<[i64; 4]>>> = (0..nt).map(|_| Mutex::new(vec![[0i64; 4]; (ncamp + 1) * ndays])).collect();
     let any_long = !reg.0.lock().unwrap().is_empty();
-    let ud: Vec<Vec<UdRow>> = (0..npb)
-        .into_par_iter()
-        .map(|b| SSCR.with(|scr| {
+    // Biggest buckets first (whales, shared devices), one task each, so the long ones start
+    // immediately and the small ones fill the gaps at the end.
+    let mut order: Vec<usize> = (0..npb).collect();
+    let weight = |b: usize| -> usize { pev.iter().map(|t| t[b].len()).sum::<usize>() + pck.iter().map(|t| t[b].len()).sum::<usize>() };
+    order.sort_by_cached_key(|&b| std::cmp::Reverse(weight(b)));
+    let ud: Vec<Vec<UdRow>> = order
+        .par_iter()
+        .with_max_len(1)
+        .map(|&b| SSCR.with(|scr| {
             // This core's reused sort buffers and campaign tally.
             let mut scr = scr.borrow_mut();
             let (ev, ck) = &mut *scr;
@@ -1834,7 +1840,9 @@ fn main() {
             for t in &pev {
                 ev.extend_from_slice(&t[b]);
             }
-            ev.sort_unstable_by_key(|e| (e.pk, e.ts));
+            if exp != 11 {
+                ev.sort_unstable_by_key(|e| (e.pk, e.ts));
+            }
             ck.clear();
             for t in &pck {
                 ck.extend_from_slice(&t[b]);
@@ -1843,8 +1851,12 @@ fn main() {
                 ck.sort_unstable_by(|a, c| {
                     a.pk.cmp(&c.pk).then(a.ts.cmp(&c.ts)).then_with(|| cmp_keys(a.ck, c.ck, reg))
                 });
-            } else {
+            } else if exp != 11 {
                 ck.sort_unstable_by_key(|c| (c.pk, c.ts, c.ck));
+            }
+            if exp == 12 {
+                std::hint::black_box((ev.len(), ck.len()));
+                return Vec::new();
             }
 
             let mut rows: Vec<UdRow> = Vec::new();
