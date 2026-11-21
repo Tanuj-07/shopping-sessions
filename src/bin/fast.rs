@@ -648,6 +648,142 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
     Some(v as i64)
 }
 
+// ---------------------------------------------------------------- fast timestamps
+//
+// `TsParser::parse` returns exactly what `parse_ts` returns, for every input; the careful
+// `parse_ts` stays as the fallback for anything off the common paths (and is what the
+// differential test compares against).
+
+#[inline(always)]
+fn load8(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+}
+
+/// True if every byte of `x` selected by `lanes` (0xFF per lane) is an ASCII digit.
+#[inline(always)]
+fn digits_in(x: u64, lanes: u64) -> bool {
+    let hi = 0xF0F0_F0F0_F0F0_F0F0u64 & lanes;
+    let want = 0x3030_3030_3030_3030u64 & lanes;
+    let xd = x & lanes;
+    // high nibble 3, and low nibble <= 9 (adding 6 must not carry into the high nibble)
+    (xd & hi) == want && ((xd + (0x0606_0606_0606_0606u64 & lanes)) & hi) == want
+}
+
+/// Eight ASCII digits (first char in the lowest byte) to their value. Digits must be checked.
+#[inline(always)]
+fn eight_digits(x: u64) -> u64 {
+    let v = x - 0x3030_3030_3030_3030;
+    let v = v.wrapping_mul(10) + (v >> 8);
+    (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32)))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000u64 << 32))))
+        >> 32
+}
+
+/// "HH:MM:SS" at b[i..i+8] -> seconds of the day, if well-formed and in range.
+#[inline(always)]
+fn hms(b: &[u8], i: usize) -> Option<i64> {
+    let x = load8(b, i);
+    const DIG: u64 = 0xFFFF_00FF_FF00_FFFF; // digit lanes 0,1,3,4,6,7
+    const COLONS: u64 = 0x0000_3A00_003A_0000; // ':' in lanes 2 and 5
+    if (x & !DIG) != COLONS || !digits_in(x, DIG) {
+        return None;
+    }
+    let d = x & 0x0F0F_000F_0F00_0F0F & DIG;
+    let v = d.wrapping_mul(10) + (d >> 8); // lane k = 10*d_k + d_{k+1}
+    let (h, m, s) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+    if h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + s)
+}
+
+/// Per-chunk timestamp parser with a tiny cache of "YYYY-MM-DD" -> day number.
+struct TsParser {
+    keys: [(u64, u16); 32],
+    days: [i64; 32], // i64::MIN = invalid date
+}
+
+impl TsParser {
+    fn new() -> Self {
+        TsParser { keys: [(u64::MAX, u16::MAX); 32], days: [0; 32] }
+    }
+
+    #[inline(always)]
+    fn date(&mut self, b: &[u8]) -> Option<i64> {
+        let k0 = load8(b, 0);
+        let k1 = u16::from_le_bytes([b[8], b[9]]);
+        let slot = ((k0 ^ (k0 >> 29) ^ ((k1 as u64) << 7)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 59) as usize;
+        if self.keys[slot] != (k0, k1) {
+            // Miss: the careful check of the date part, exactly as in parse_ts.
+            let d = (|| {
+                if b[4] != b'-' || b[7] != b'-' {
+                    return None;
+                }
+                let y = d2(b, 0)? * 100 + d2(b, 2)?;
+                let mo = d2(b, 5)?;
+                let d = d2(b, 8)?;
+                if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+                    return None;
+                }
+                Some(days_from_civil(y, mo, d))
+            })();
+            self.keys[slot] = (k0, k1);
+            self.days[slot] = d.unwrap_or(i64::MIN);
+        }
+        let d = self.days[slot];
+        if d == i64::MIN {
+            None
+        } else {
+            Some(d)
+        }
+    }
+
+    #[inline(always)]
+    fn parse(&mut self, b: &[u8]) -> Option<i64> {
+        let n = b.len();
+        if n == 20 || n == 25 {
+            if b[4] == b'-' {
+                if b[10] != b'T' {
+                    return None;
+                }
+                let day = self.date(b)?;
+                let secs = hms(b, 11)?;
+                let off_ms = if n == 20 {
+                    if b[19] != b'Z' {
+                        return None;
+                    }
+                    0
+                } else {
+                    let sign = match b[19] {
+                        b'+' => 1,
+                        b'-' => -1,
+                        _ => return None,
+                    };
+                    let oh = d2(b, 20)?;
+                    if b[22] != b':' {
+                        return None;
+                    }
+                    let om = d2(b, 23)?;
+                    if oh > 23 || om > 59 {
+                        return None;
+                    }
+                    sign * (oh * 60 + om) * 60_000
+                };
+                return Some((day * 86_400 + secs) * 1000 - off_ms);
+            }
+        } else if n == 13 {
+            // Epoch milliseconds, the usual 13 digits: digits 0..8 and 5..13 (overlapping).
+            let a = load8(b, 0);
+            let c = load8(b, 5);
+            if digits_in(a, u64::MAX) && digits_in(c, u64::MAX) {
+                return Some(((eight_digits(a) / 1000) * 100_000_000 + eight_digits(c)) as i64);
+            }
+            return None;
+        }
+        parse_ts(b)
+    }
+}
+
 #[inline]
 fn parse_price(b: &[u8]) -> Option<u32> {
     if b.is_empty() {
@@ -1021,6 +1157,7 @@ fn main() {
                 std::hint::black_box(buf.len());
                 return;
             }
+            let mut tsp = TsParser::new();
             scan_fields::<7>(buf, cs, ce, |fb| {
                 if exp == 2 {
                     std::hint::black_box(fb);
@@ -1031,7 +1168,7 @@ fn main() {
                     return;
                 }
                 let ek = key_of(buf, es, ee - es, None);
-                let ingest_ms = if exp == 3 { std::hint::black_box(ws + 5000) } else { parse_ts(&buf[fb[3].0..fb[3].1]).unwrap_or(i64::MAX / 4) };
+                let ingest_ms = if exp == 3 { std::hint::black_box(ws + 5000) } else { tsp.parse(&buf[fb[3].0..fb[3].1]).unwrap_or(i64::MAX / 4) };
                 let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                 let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
                 'v: {
@@ -1039,7 +1176,7 @@ fn main() {
                     if us == ue {
                         break 'v;
                     }
-                    let Some(ts) = (if exp == 3 { Some(std::hint::black_box(ws + 1000)) } else { parse_ts(&buf[fb[2].0..fb[2].1]) }) else { break 'v };
+                    let Some(ts) = (if exp == 3 { Some(std::hint::black_box(ws + 1000)) } else { tsp.parse(&buf[fb[2].0..fb[2].1]) }) else { break 'v };
                     if ts < ws || ts >= we {
                         break 'v;
                     }
@@ -1137,13 +1274,14 @@ fn main() {
     let pck: PerThread<PCk> = PerThread::new(nt, npb, (ck_bytes / 45 / npb / nt) * 5 / 4 + 16);
     ck_chunks.par_iter().for_each(|c| {
         pck.with(|g| with_chunk(c, &mut |buf, s0, e0| {
+            let mut tsp = TsParser::new();
             scan_fields::<4>(buf, s0, e0, |fb| {
                 let (cs, ce) = fb[0];
                 let (us, ue) = fb[1];
                 if cs == ce || us == ue {
                     return;
                 }
-                let Some(ts) = parse_ts(&buf[fb[3].0..fb[3].1]) else { return };
+                let Some(ts) = tsp.parse(&buf[fb[3].0..fb[3].1]) else { return };
                 if ts < base || ts >= we {
                     return;
                 }
@@ -1406,4 +1544,84 @@ fn top_cat(cats: &mut [i64], touched: &mut Vec<u16>) -> u16 {
     }
     touched.clear();
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every timestamp string in the dev data, plus many mangled variants, must parse
+    /// identically with the fast parser and the careful one.
+    #[test]
+    fn fast_timestamps_match_careful_parser() {
+        let dir = std::env::var("TS_TEST_DATA").unwrap_or_else(|_| "C:/dev/shopping-sessions/data/dev".into());
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for sub in ["events", "clicks"] {
+            for p in csv_files(&Path::new(&dir).join(sub)) {
+                let buf = fs::read(p).unwrap();
+                for line in buf.split(|&c| c == b'\n').skip(1) {
+                    let f: Vec<&[u8]> = line.split(|&c| c == b',').collect();
+                    let cols: &[usize] = if sub == "events" { &[2, 3] } else { &[3] };
+                    for &c in cols {
+                        if let Some(v) = f.get(c) {
+                            let v = if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' { &v[1..v.len() - 1] } else { v };
+                            samples.push(v.to_vec());
+                        }
+                    }
+                }
+            }
+        }
+        // Hand-written edge cases.
+        for s in [
+            "2028-02-29T12:00:00Z", "2027-02-29T12:00:00Z", "2026-13-01T00:00:00Z", "2026-00-10T00:00:00Z",
+            "2026-10-03T24:00:00Z", "2026-10-03T23:60:00Z", "2026-10-03T23:59:60Z", "2026-10-03 10:00:00Z",
+            "2026-10-03t10:00:00Z", "2026-10-03T10:00:00z", "2026-10-03T10:00:00+24:00", "2026-10-03T10:00:00+05:60",
+            "2026-10-03T10:00:00+0200", "2026-10-03T10:00:00-00:00", "2026-10-03T10:00:00+23:59", "1791071890000",
+            "0001791071890000", "86400000", "1791071890000.0", "1.79e12", "-5", "", "179107189000a", "a791071890000",
+            "9999999999999", "0000000000000", "2026-10-03T10:00:00.000Z", "2026-1O-03T10:00:00Z", "2026-10-03T10:0:000Z",
+        ] {
+            samples.push(s.as_bytes().to_vec());
+        }
+        let base_n = samples.len();
+        // Mangle each sample: replace one byte, drop one byte, duplicate one byte.
+        let alphabet = b"0159:-+TZzt .\r/\x00\xff";
+        let mut rng: u64 = 0x1234_5678;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for i in 0..base_n.min(400_000) {
+            let s = samples[i].clone();
+            if s.is_empty() {
+                continue;
+            }
+            let pos = (next() as usize) % s.len();
+            let mut a = s.clone();
+            a[pos] = alphabet[(next() as usize) % alphabet.len()];
+            samples.push(a);
+            let mut b = s.clone();
+            b.remove(pos);
+            samples.push(b);
+            let mut c = s.clone();
+            c.insert(pos, s[pos]);
+            samples.push(c);
+        }
+        let mut tsp = TsParser::new();
+        let mut checked = 0usize;
+        for (i, s) in samples.iter().enumerate() {
+            if i % 5000 == 0 {
+                tsp = TsParser::new(); // exercise cold caches too
+            }
+            // Parsers read up to 16 bytes past a field inside their buffers; mimic that slack.
+            let mut padded = s.clone();
+            padded.extend_from_slice(&[b','; 16]);
+            let fast = tsp.parse(&padded[..s.len()]);
+            let careful = parse_ts(s);
+            assert_eq!(fast, careful, "mismatch on {:?}", String::from_utf8_lossy(s));
+            checked += 1;
+        }
+        eprintln!("checked {checked} timestamp strings ({base_n} real + mangled)");
+    }
 }
