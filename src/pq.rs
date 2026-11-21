@@ -14,6 +14,11 @@ pub enum Col<'a> {
     I64(Vec<i64>),
     /// Required INT32.
     I32(Vec<i32>),
+    /// Required UTF8, already PLAIN-encoded (u32 length + bytes per value), and its row count.
+    StrEnc(Vec<u8>, usize),
+    /// Optional UTF8: presence bits (bit i of byte i/8 = row i) and the PLAIN-encoded present
+    /// values, and the row count.
+    OptStrEnc { bits: Vec<u8>, vals: Vec<u8>, rows: usize },
 }
 
 impl Col<'_> {
@@ -24,11 +29,13 @@ impl Col<'_> {
             Col::Date(v) => v.len(),
             Col::I64(v) => v.len(),
             Col::I32(v) => v.len(),
+            Col::StrEnc(_, n) => *n,
+            Col::OptStrEnc { rows, .. } => *rows,
         }
     }
     fn physical(&self) -> i32 {
         match self {
-            Col::Str(_) | Col::OptStr(_) => 6, // BYTE_ARRAY
+            Col::Str(_) | Col::OptStr(_) | Col::StrEnc(..) | Col::OptStrEnc { .. } => 6, // BYTE_ARRAY
             Col::Date(_) | Col::I32(_) => 1,   // INT32
             Col::I64(_) => 2,                  // INT64
         }
@@ -148,6 +155,45 @@ fn encode_values(col: &Col, out: &mut Vec<u8>) {
         Col::Date(v) => out.extend_from_slice(le_bytes(v)),
         Col::I64(v) => out.extend_from_slice(le_bytes(v)),
         Col::I32(v) => out.extend_from_slice(le_bytes(v)),
+        Col::StrEnc(..) | Col::OptStrEnc { .. } => unreachable!("written from its parts"),
+    }
+}
+
+/// Definition-level block header for `rows` rows given as presence bits: the block's byte
+/// length, then the header varint of one bit-packed run (the bits themselves follow).
+fn def_block(bits: &[u8], rows: usize) -> Vec<u8> {
+    let groups = rows.div_ceil(8);
+    assert_eq!(bits.len(), groups);
+    let mut h = ((groups as u64) << 1) | 1;
+    let mut hv = Vec::with_capacity(10);
+    while h >= 0x80 {
+        hv.push((h as u8) | 0x80);
+        h >>= 7;
+    }
+    hv.push(h as u8);
+    let mut lv = Vec::with_capacity(16);
+    lv.extend_from_slice(&((hv.len() + groups) as u32).to_le_bytes());
+    lv.extend_from_slice(&hv);
+    lv
+}
+
+/// The column's encoded page data as byte slices (no copy for the big columns).
+fn parts<'b>(col: &'b Col, tmp: &'b mut Vec<u8>) -> Vec<&'b [u8]> {
+    match col {
+        Col::Date(v) => vec![le_bytes(v)],
+        Col::I32(v) => vec![le_bytes(v)],
+        Col::I64(v) => vec![le_bytes(v)],
+        Col::StrEnc(b, _) => vec![&b[..]],
+        Col::OptStrEnc { bits, vals, rows } => {
+            *tmp = def_block(bits, *rows);
+            vec![&tmp[..], &bits[..], &vals[..]]
+        }
+        _ => {
+            tmp.clear();
+            tmp.reserve(encoded_len(col));
+            encode_values(col, tmp);
+            vec![&tmp[..]]
+        }
     }
 }
 
@@ -178,17 +224,24 @@ fn encoded_len(col: &Col) -> usize {
         Col::Date(v) => 4 * v.len(),
         Col::I64(v) => 8 * v.len(),
         Col::I32(v) => 4 * v.len(),
+        Col::StrEnc(b, _) => b.len(),
+        Col::OptStrEnc { bits, vals, rows } => def_block(bits, *rows).len() + bits.len() + vals.len(),
     }
 }
 
 pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()> {
     let rows = cols.first().map(|c| c.1.len()).unwrap_or(0);
-    let sizes: Vec<usize> = cols.iter().map(|(_, c)| encoded_len(c)).collect();
-    let mut out: Vec<u8> = Vec::with_capacity(sizes.iter().sum::<usize>() + 64 * cols.len() + 4096);
-    out.extend_from_slice(b"PAR1");
+    // Pieces go straight to the file (big ones bypass the 64 KB buffer): no file-sized copy.
+    let mut out = std::io::BufWriter::with_capacity(64 << 10, std::fs::File::create(path)?);
+    out.write_all(b"PAR1")?;
+    let mut pos = 4usize;
     let mut chunks: Vec<(i64, i64)> = Vec::new(); // (offset, total size)
-    for ((_, col), &dlen) in cols.iter().zip(&sizes) {
+    for (_, col) in cols.iter() {
         assert_eq!(col.len(), rows);
+        let mut tmp = Vec::new();
+        let ps = parts(col, &mut tmp);
+        let dlen: usize = ps.iter().map(|p| p.len()).sum();
+        debug_assert_eq!(dlen, encoded_len(col));
         let mut h = Thrift::new();
         h.i32(1, 0); // DATA_PAGE
         h.i32(2, dlen as i32);
@@ -200,12 +253,12 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
         h.i32(4, 3); // RLE rep levels
         h.end();
         h.stop();
-        let off = out.len() as i64;
-        out.extend_from_slice(&h.buf);
-        let before = out.len();
-        encode_values(col, &mut out); // straight into the file buffer
-        debug_assert_eq!(out.len() - before, dlen);
-        assert_eq!(out.len() - before, dlen, "encoded size mismatch");
+        let off = pos as i64;
+        out.write_all(&h.buf)?;
+        for p in &ps {
+            out.write_all(p)?;
+        }
+        pos += h.buf.len() + dlen;
         chunks.push((off, (h.buf.len() + dlen) as i64));
     }
 
@@ -219,10 +272,10 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
     for (name, col) in cols {
         m.begin_elem();
         m.i32(1, col.physical());
-        m.i32(3, if matches!(col, Col::OptStr(_)) { 1 } else { 0 });
+        m.i32(3, if matches!(col, Col::OptStr(_) | Col::OptStrEnc { .. }) { 1 } else { 0 });
         m.bin(4, name.as_bytes());
         match col {
-            Col::Str(_) | Col::OptStr(_) => {
+            Col::Str(_) | Col::OptStr(_) | Col::StrEnc(..) | Col::OptStrEnc { .. } => {
                 m.i32(6, 0); // converted UTF8
                 m.begin(10); // LogicalType
                 m.begin(1); // STRING
@@ -271,8 +324,8 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
     m.bin(6, b"shopping-sessions");
     m.stop();
 
-    out.extend_from_slice(&m.buf);
-    out.extend_from_slice(&(m.buf.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    std::fs::File::create(path)?.write_all(&out)
+    out.write_all(&m.buf)?;
+    out.write_all(&(m.buf.len() as u32).to_le_bytes())?;
+    out.write_all(b"PAR1")?;
+    out.flush()
 }

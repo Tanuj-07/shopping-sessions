@@ -2514,41 +2514,53 @@ fn main() {
 
     let nfiles = nt.min(npb);
     let groups: Vec<Vec<&Vec<UdRow>>> = (0..nfiles).map(|k| ud.iter().skip(k).step_by(nfiles).collect()).collect();
-    let cat_names_ref = &cat_names;
+    // Category names PLAIN-encoded once (u32 length + bytes).
+    let cat_enc: Vec<Vec<u8>> = cat_names
+        .iter()
+        .map(|c| {
+            let mut v = (c.len() as u32).to_le_bytes().to_vec();
+            v.extend_from_slice(c);
+            v
+        })
+        .collect();
+    let cat_enc_ref = &cat_enc;
     let ud_dir_ref = &ud_dir;
     rayon::scope(|sc| {
         for (k, g) in groups.iter().enumerate() {
             sc.spawn(move |_| {
                 let n: usize = g.iter().map(|v| v.len()).sum();
-                // Names: short keys decode into an arena; long keys come from the registry.
-                let mut arena: Vec<u8> = Vec::with_capacity(n * 12);
-                let mut spans: Vec<(usize, usize)> = Vec::with_capacity(n);
-                for v in g {
-                    for r in v.iter() {
-                        let s = arena.len();
-                        if r.pk.is_long() {
-                            arena.extend_from_slice(&key_bytes(r.pk, reg));
-                        } else {
-                            decode_compact(r.pk, &mut arena);
-                        }
-                        spans.push((s, arena.len()));
-                    }
-                }
-                let uid: Vec<&[u8]> = spans.iter().map(|&(s, e)| &arena[s..e]).collect();
-                // Counts are bounded by the number of events (< 2^31), so INT32 always holds them;
+                // Columns are encoded directly in their Parquet PLAIN form: names decode straight
+                // into the length-prefixed byte column, the top category into presence bits +
+                // values. Counts are bounded by the number of events (< 2^31), so INT32 holds them;
                 // revenue is INT32 when every value fits, INT64 otherwise (any width is accepted).
-                let mut day = Vec::with_capacity(n);
+                let mut uid: Vec<u8> = Vec::with_capacity(n * 14);
+                let mut day: Vec<i32> = Vec::with_capacity(n);
                 let mut ses: Vec<i32> = Vec::with_capacity(n);
                 let mut evs: Vec<i32> = Vec::with_capacity(n);
-                let mut top: Vec<Option<&[u8]>> = Vec::with_capacity(n);
+                let mut bits = vec![0u8; n.div_ceil(8)];
+                let mut tops: Vec<u8> = Vec::with_capacity(n * 4);
                 let mut rev_fits = true;
+                let mut i = 0usize;
                 for v in g {
                     for r in v.iter() {
+                        let s = uid.len();
+                        uid.extend_from_slice(&[0u8; 4]);
+                        if r.pk.is_long() {
+                            uid.extend_from_slice(&key_bytes(r.pk, reg));
+                        } else {
+                            decode_compact(r.pk, &mut uid);
+                        }
+                        let l = (uid.len() - s - 4) as u32;
+                        uid[s..s + 4].copy_from_slice(&l.to_le_bytes());
                         day.push(r.day);
                         ses.push(r.sessions as i32);
                         evs.push(r.events as i32);
                         rev_fits &= r.revenue <= i32::MAX as i64;
-                        top.push(if r.top == u16::MAX { None } else { Some(cat_names_ref[r.top as usize]) });
+                        if r.top != u16::MAX {
+                            bits[i >> 3] |= 1 << (i & 7);
+                            tops.extend_from_slice(&cat_enc_ref[r.top as usize]);
+                        }
+                        i += 1;
                     }
                 }
                 let rev = if rev_fits {
@@ -2559,12 +2571,12 @@ fn main() {
                 pq::write(
                     &ud_dir_ref.join(format!("part-{k}.parquet")),
                     &[
-                        ("user_id", Col::Str(uid)),
+                        ("user_id", Col::StrEnc(uid, n)),
                         ("day", Col::Date(day)),
                         ("sessions", Col::I32(ses)),
                         ("events", Col::I32(evs)),
                         ("revenue_cents", rev),
-                        ("top_category", Col::OptStr(top)),
+                        ("top_category", Col::OptStrEnc { bits, vals: tops, rows: n }),
                     ],
                 )
                 .unwrap();
