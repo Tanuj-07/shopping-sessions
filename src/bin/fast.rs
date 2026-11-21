@@ -1459,10 +1459,13 @@ fn main() {
     let ncat = cat_names.len();
     let cat_index = |c: &[u8]| cat_names.binary_search(&c).unwrap() as u32;
     let unknown_cat = cat_index(b"unknown");
+    // product_id is unique in products.csv; if it ever were not, keep the last row as before.
     let mut prod_cat: FxHashMap<&[u8], u32> = FxHashMap::default();
     for (p, c) in &prod_raw {
         prod_cat.insert(p, cat_index(c));
     }
+    let prod_items: Vec<(&[u8], u32)> = prod_cat.iter().map(|(p, c)| (*p, *c)).collect();
+    let prod_tab = SmallTab::new(&prod_items);
     let mut camp_ids: Vec<&[u8]> = Vec::new();
     let mut camp_chan: Vec<&[u8]> = Vec::new();
     let mut camp_idx: FxHashMap<&[u8], u32> = FxHashMap::default();
@@ -1651,9 +1654,17 @@ fn main() {
                     if ts < ws || ts >= we {
                         break 'v;
                     }
-                    let purchase = match &buf[fb[4].0..fb[4].1] {
-                        b"view" | b"cart" => false,
-                        b"purchase" => true,
+                    let (ty, tye) = fb[4];
+                    let purchase = match tye - ty {
+                        4 => {
+                            let w = u32::from_le_bytes([buf[ty], buf[ty + 1], buf[ty + 2], buf[ty + 3]]);
+                            if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
+                                false
+                            } else {
+                                break 'v;
+                            }
+                        }
+                        8 if load8(buf, ty) == u64::from_le_bytes(*b"purchase") => true,
                         _ => break 'v,
                     };
                     let (ps, pe) = fb[5];
@@ -1665,7 +1676,7 @@ fn main() {
                     }
                     if purchase {
                         let Some(price) = parse_price(&buf[fb[6].0..fb[6].1]) else { break 'v };
-                        let cat = prod_cat.get(&buf[ps..pe]).copied().unwrap_or(unknown_cat);
+                        let cat = prod_tab.get(buf, ps, pe - ps).unwrap_or(unknown_cat);
                         r.pc = price | (cat << 24);
                     }
                     r.uk = match uk_fast {
