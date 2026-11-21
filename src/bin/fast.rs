@@ -25,6 +25,54 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use shopping_sessions::pq::{self, Col};
 
+/// Linux: back every big allocation (>= 4 MB: the record buckets, tables, sort space) with
+/// 2 MB transparent huge pages. That is 512x fewer pages to fault in while running and to tear
+/// down at exit. madvise is only a hint: if THP is off on the host, nothing changes.
+#[cfg(target_os = "linux")]
+mod hugealloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    pub struct Huge;
+    const BIG: usize = 4 << 20;
+    const HP: usize = 2 << 20;
+    unsafe fn advise(p: *mut u8, size: usize) {
+        let start = (p as usize + HP - 1) & !(HP - 1);
+        let end = (p as usize + size) & !(HP - 1);
+        if end > start {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+        }
+    }
+    unsafe impl GlobalAlloc for Huge {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = System.alloc(l);
+            if !p.is_null() && l.size() >= BIG {
+                advise(p, l.size());
+            }
+            p
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            let p = System.alloc_zeroed(l);
+            if !p.is_null() && l.size() >= BIG {
+                advise(p, l.size());
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            System.dealloc(p, l)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
+            let q = System.realloc(p, l, new_size);
+            if !q.is_null() && new_size >= BIG {
+                advise(q, new_size);
+            }
+            q
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: hugealloc::Huge = hugealloc::Huge;
+
 const DAY_MS: i64 = 86_400_000;
 const GAP_MS: u32 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
