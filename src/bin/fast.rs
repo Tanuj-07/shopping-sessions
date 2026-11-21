@@ -1330,15 +1330,25 @@ impl SmallTab {
 
 // ---------------------------------------------------------------- records
 
-/// Event copy before dedup (28 bytes). ts == u32::MAX marks an invalid copy.
+/// Event copy before dedup (24 bytes): views, carts and every invalid copy (ts == u32::MAX).
 #[derive(Clone, Copy, Default)]
-#[repr(C, packed(4))]
 struct ERaw {
     em: u64, // bmix(event key): equal iff the keys are equal; top bits pick the bucket, low bits the slot
     uk: K,
     ingest: u32,
     ts: u32,
-    pc: u32, // price | cat << 24; 0 for view/cart
+}
+
+/// A valid purchase copy before dedup (28 bytes): the same fields plus price and category.
+/// Purchases are ~3% of events, so keeping them apart saves 4 bytes on all the others.
+#[derive(Clone, Copy, Default)]
+#[repr(C, packed(4))]
+struct EPur {
+    em: u64,
+    uk: K,
+    ingest: u32,
+    ts: u32,
+    pc: u32, // price | cat << 24 (never 0)
 }
 
 /// Invertible 64-bit mix (odd multiplies and xor-shifts), so it can stand in for the key
@@ -2057,8 +2067,9 @@ fn main() {
             // ------------------------------------------------------------ 2. events parse
             let ev_chunks = make_chunks(sizes, 0..ne);
             let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
+            let stage1p: PerThread<EPur> = PerThread::new(nt, neb, 0);
             ev_chunks.par_iter().for_each(|c| {
-                stage1.with(|g| with_chunk(c, &mut |buf, cs, ce| {
+                stage1.with(|g| stage1p.with(|gp| with_chunk(c, &mut |buf, cs, ce| {
                     if exp == 4 {
                         std::hint::black_box(buf.len());
                         return;
@@ -2094,7 +2105,8 @@ fn main() {
                         // is cheaper than div_euclid (values here are far above zero).
                         let ingest = ((ingest_ms as u64 / 1000) as i64 - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                         let hm = bmix(ek.0);
-                        let mut r = ERaw { em: hm, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
+                        let mut r = ERaw { em: hm, uk: K::EMPTY, ingest, ts: u32::MAX };
+                        let mut pc = 0u32;
                         'v: {
                             if us == ue {
                                 break 'v;
@@ -2126,7 +2138,7 @@ fn main() {
                             if purchase {
                                 let Some(price) = parse_price(fld(buf, fb[6])) else { break 'v };
                                 let cat = prod_tab.get(buf, ps, pe - ps).unwrap_or(unknown_cat);
-                                r.pc = price | (cat << 24);
+                                pc = price | (cat << 24);
                             }
                             r.uk = match uk_fast {
                                 Some(k) => k,
@@ -2138,14 +2150,20 @@ fn main() {
                             std::hint::black_box(r);
                             return;
                         }
-                        unsafe { g.get_unchecked_mut((hm >> (64 - eb)) as usize) }.push(r);
+                        let bk = (hm >> (64 - eb)) as usize;
+                        if pc == 0 {
+                            unsafe { g.get_unchecked_mut(bk) }.push(r);
+                        } else {
+                            unsafe { gp.get_unchecked_mut(bk) }.push(EPur { em: r.em, uk: r.uk, ingest: r.ingest, ts: r.ts, pc });
+                        }
                     });
-                }));
+                })));
             });
-            stage1.into_inner()
+            (stage1.into_inner(), stage1p.into_inner())
         },
     );
     let pmap = &pmap;
+    let (stage1, stage1p) = stage1;
     lap(&format!("links + events parse ({ev_chunk_count} chunks)"));
 
     // ------------------------------------------------------------ 3. dedup -> person buckets
@@ -2156,7 +2174,8 @@ fn main() {
         kept.clear();
         used.clear();
         let parts: Vec<&Stream<ERaw>> = stage1.iter().map(|t| &t[b]).collect();
-        let n: usize = parts.iter().map(|p| p.len()).sum();
+        let partsp: Vec<&Stream<EPur>> = stage1p.iter().map(|t| &t[b]).collect();
+        let n: usize = parts.iter().map(|p| p.len()).sum::<usize>() + partsp.iter().map(|p| p.len()).sum::<usize>();
         let cap = ((n * 3) / 2).next_power_of_two().max(16);
         let mask = cap - 1;
         // Reuse this core's table: clearing warm memory beats faulting in fresh pages.
@@ -2166,54 +2185,73 @@ fn main() {
         // The table is always left all-empty by the previous bucket (the read pass below
         // resets every slot it reads), so there is no separate clearing pass.
         let slots = &mut slots[..cap];
-        let get = |x: u32| unsafe { parts.get_unchecked((x >> 26) as usize).get((x & ((1 << 26) - 1)) as usize) };
-        for (t, part) in parts.iter().enumerate() {
-            let mut base_i = 0usize;
-            for chunk in part.chunks() {
-            for (j, r) in chunk.iter().enumerate() {
-                let i = base_i + j;
-                // Start loading the slot the record 8 ahead will probe.
-                if let Some(ahead) = chunk.get(j + 8) {
-                    prefetch(unsafe { slots.as_ptr().add((ahead.em as usize) & mask) });
-                }
-                let packed = ((t as u32) << 26) | i as u32;
-                let (rem, ring) = (r.em, r.ingest);
-                let mut s = (rem as usize) & mask;
-                loop {
-                    let sl = unsafe { slots.get_unchecked_mut(s) };
-                    if sl.k.is_empty() {
-                        *sl = DSlot { k: K(rem), idx: packed, ingest: ring };
-                        used.push(s as u32);
-                        break;
-                    }
-                    if sl.k.0 == rem {
-                        if ring < sl.ingest {
-                            sl.idx = packed;
-                            sl.ingest = ring;
+        // A copy's place: bit 31 = purchase stream, bits 26..31 = thread, low 26 bits = index.
+        let get = |x: u32| -> (K, u32, u32) {
+            let (t, i) = (((x >> 26) & 31) as usize, (x & ((1 << 26) - 1)) as usize);
+            if x >> 31 == 0 {
+                let r = unsafe { parts.get_unchecked(t) }.get(i);
+                (r.uk, r.ts, 0)
+            } else {
+                let r = unsafe { partsp.get_unchecked(t) }.get(i);
+                (r.uk, r.ts, r.pc)
+            }
+        };
+        macro_rules! insert_all {
+            ($parts:expr, $kind:expr) => {
+                for (t, part) in $parts.iter().enumerate() {
+                    let mut base_i = 0usize;
+                    for chunk in part.chunks() {
+                        for (j, r) in chunk.iter().enumerate() {
+                            let i = base_i + j;
+                            // Start loading the slot the record 8 ahead will probe.
+                            if let Some(ahead) = chunk.get(j + 8) {
+                                prefetch(unsafe { slots.as_ptr().add((ahead.em as usize) & mask) });
+                            }
+                            let packed = ($kind << 31) | ((t as u32) << 26) | i as u32;
+                            let (rem, ring) = (r.em, r.ingest);
+                            let mut s = (rem as usize) & mask;
+                            loop {
+                                let sl = unsafe { slots.get_unchecked_mut(s) };
+                                if sl.k.is_empty() {
+                                    *sl = DSlot { k: K(rem), idx: packed, ingest: ring };
+                                    used.push(s as u32);
+                                    break;
+                                }
+                                if sl.k.0 == rem {
+                                    if ring < sl.ingest {
+                                        sl.idx = packed;
+                                        sl.ingest = ring;
+                                    }
+                                    break;
+                                }
+                                s = (s + 1) & mask;
+                            }
                         }
-                        break;
+                        base_i += chunk.len();
                     }
-                    s = (s + 1) & mask;
                 }
-            }
-            base_i += chunk.len();
-            }
+            };
         }
+        insert_all!(parts, 0u32);
+        insert_all!(partsp, 1u32);
         pev.with(|g| {
             // Visit only the slots that were filled (no scan over empty ones).
             for &s in used.iter() {
                 let sl = unsafe { slots.get_unchecked_mut(s as usize) };
                 let idx = sl.idx;
                 *sl = DSlot::EMPTY; // reset while the line is in cache: next bucket starts clean
-                let r = get(idx);
-                if r.ts == u32::MAX {
+                let (uk, ts, pc) = get(idx);
+                if ts == u32::MAX {
                     continue;
                 }
-                kept.push((r.uk, r.ts, r.pc));
+                kept.push((uk, ts, pc));
             }
             // This event bucket is fully consumed: recycle its blocks for the person records
             // written next (they are already in memory, so no fresh page faults).
             for part in parts.iter() {
+                pool_give(&part.blocks);
+            }
+            for part in partsp.iter() {
                 pool_give(&part.blocks);
             }
             // Person lookups jump around a table far bigger than the CPU cache. Ask for the
@@ -2237,6 +2275,7 @@ fn main() {
         });
     }));
     std::mem::forget(stage1); // freeing is pointless work: the OS reclaims it at exit
+    std::mem::forget(stage1p);
     let pev = pev.into_inner();
     lap("dedup");
     // ------------------------------------------------------------ 4. clicks
