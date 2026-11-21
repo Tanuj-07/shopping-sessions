@@ -78,7 +78,6 @@ const GAP_MS: u32 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const EB: u32 = 10; // event dedup bucket bits
 const PB: u32 = 10; // person bucket bits
-const RADIX_MIN: usize = 2048; // per-person event groups this big are radix-sorted
 const LB: u32 = 8; // link id table bits
 const CHUNK: usize = 4 << 20;
 
@@ -1326,9 +1325,10 @@ impl PIdx {
 struct SessScratch {
     ev: Vec<PEv>,
     ck: Vec<PCk>,
-    rtmp: Vec<PEv>,
-    gi: Vec<u32>,
-    cgi: Vec<u32>,
+    ea: Vec<PEv>,
+    eb: Vec<PEv>,
+    ca: Vec<PCk>,
+    cb: Vec<PCk>,
     est: Vec<u32>,
     cst: Vec<u32>,
     pidx: PIdx,
@@ -1336,7 +1336,7 @@ struct SessScratch {
 
 impl SessScratch {
     const fn new() -> Self {
-        SessScratch { ev: Vec::new(), ck: Vec::new(), rtmp: Vec::new(), gi: Vec::new(), cgi: Vec::new(), est: Vec::new(), cst: Vec::new(), pidx: PIdx::new() }
+        SessScratch { ev: Vec::new(), ck: Vec::new(), ea: Vec::new(), eb: Vec::new(), ca: Vec::new(), cb: Vec::new(), est: Vec::new(), cst: Vec::new(), pidx: PIdx::new() }
     }
 }
 
@@ -1350,67 +1350,43 @@ impl Drop for TaskTimer<'_> {
     }
 }
 
-/// LSD radix sort of events by ts (4 passes of 8 bits; a pass is skipped when every element
-/// has the same byte there). For the giant per-person groups (whales).
-fn radix_sort_ts(v: &mut [PEv], tmp: &mut Vec<PEv>) {
-    let n = v.len();
-    tmp.clear();
-    tmp.reserve(n);
-    unsafe { tmp.set_len(n) };
-    let mut counts = [[0u32; 256]; 4];
-    for e in v.iter() {
-        for (k, c) in counts.iter_mut().enumerate() {
-            c[((e.ts >> (8 * k)) & 0xFF) as usize] += 1;
-        }
+/// Stable LSD radix sort of `a` by a 31-bit key (3 passes of 11 + 10 + 10 bits, a pass skipped
+/// when all keys share those bits). `b` is scratch. Returns true if the result is in `a`.
+fn radix31<T: Copy>(a: &mut Vec<T>, b: &mut Vec<T>, key: impl Fn(&T) -> u32) -> bool {
+    let n = a.len();
+    b.clear();
+    b.reserve(n);
+    unsafe { b.set_len(n) };
+    let mut c0 = [0u32; 2048];
+    let mut c1 = [0u32; 1024];
+    let mut c2 = [0u32; 1024];
+    for x in a.iter() {
+        let t = key(x);
+        c0[(t & 2047) as usize] += 1;
+        c1[((t >> 11) & 1023) as usize] += 1;
+        c2[((t >> 21) & 1023) as usize] += 1;
     }
-    let mut in_v = true; // where the current data lives
-    for (k, c) in counts.iter().enumerate() {
+    let mut in_a = true;
+    let passes: [(&mut [u32], u32, u32); 3] = [(&mut c0[..], 0, 2047), (&mut c1[..], 11, 1023), (&mut c2[..], 21, 1023)];
+    for (c, shift, mask) in passes {
         if c.iter().any(|&x| x as usize == n) {
-            continue; // all elements share this byte: the pass would not move anything
+            continue;
         }
-        let mut off = [0u32; 256];
         let mut acc = 0u32;
-        for d in 0..256 {
-            off[d] = acc;
-            acc += c[d];
+        for x in c.iter_mut() {
+            let v = *x;
+            *x = acc;
+            acc += v;
         }
-        let shift = 8 * k;
-        if in_v {
-            for e in v.iter() {
-                let d = ((e.ts >> shift) & 0xFF) as usize;
-                unsafe { *tmp.get_unchecked_mut(off[d] as usize) = *e };
-                off[d] += 1;
-            }
-        } else {
-            for e in tmp.iter() {
-                let d = ((e.ts >> shift) & 0xFF) as usize;
-                unsafe { *v.get_unchecked_mut(off[d] as usize) = *e };
-                off[d] += 1;
-            }
+        let (src, dst) = if in_a { (&a[..], &mut b[..]) } else { (&b[..], &mut a[..]) };
+        for x in src.iter() {
+            let d = ((key(x) >> shift) & mask) as usize;
+            unsafe { *dst.get_unchecked_mut(*c.get_unchecked(d) as usize) = *x };
+            c[d] += 1;
         }
-        in_v = !in_v;
+        in_a = !in_a;
     }
-    if !in_v {
-        v.copy_from_slice(tmp);
-    }
-}
-
-/// Insertion sort for the small per-person groups; big groups use the library sort.
-#[inline(always)]
-fn sort_small_by<T: Copy + Send>(v: &mut [T], less: impl Fn(&T, &T) -> bool + Sync, big: impl FnOnce(&mut [T])) {
-    if v.len() <= 24 {
-        for i in 1..v.len() {
-            let x = v[i];
-            let mut j = i;
-            while j > 0 && less(&x, &v[j - 1]) {
-                v[j] = v[j - 1];
-                j -= 1;
-            }
-            v[j] = x;
-        }
-    } else {
-        big(v);
-    }
+    in_a
 }
 
 /// Dedup table slot: event key, where the kept copy is, and its ingest time (one cache access).
@@ -2110,102 +2086,98 @@ fn main() {
         .with_max_len(1)
         .map(|&b| SSCR.with(|scr| {
             let _tt = TaskTimer(exp == 13, if exp == 13 { Instant::now() } else { t0 }, b, &task_times);
-            // Group this bucket's events and clicks by person (counting, no comparisons), then
-            // sort only within each person. Person order does not matter for the output.
+            // Group this bucket's events and clicks by person AND sort them by time, with no
+            // comparisons: one radix sort of the whole bucket by ts, then a stable counting
+            // scatter by person id. Person order does not matter for the output. While grouping,
+            // each record's pk field holds its dense person id (the real key is pidx.keys[id]).
             let mut scr = scr.borrow_mut();
-            let SessScratch { ev, ck, rtmp, gi, cgi, est, cst, pidx } = &mut *scr;
+            let SessScratch { ev, ck, ea, eb, ca, cb, est, cst, pidx, .. } = &mut *scr;
             let n_ev: usize = pev.iter().map(|t| t[b].len()).sum();
-            let n_ck: usize = pck.iter().map(|t| t[b].len()).sum();
             pidx.reset(n_ev / 16 + 16);
-            gi.clear();
+            ea.clear();
+            ea.reserve(n_ev);
             for t in &pev {
                 for e in t[b].iter() {
-                    gi.push(pidx.id(e.pk));
+                    ea.push(PEv { pk: K(pidx.id(e.pk) as u64), ts: e.ts, pc: e.pc });
                 }
             }
             let np = pidx.keys.len();
             est.clear();
             est.resize(np + 2, 0);
-            for &g in gi.iter() {
-                est[g as usize + 2] += 1;
+            for e in ea.iter() {
+                est[e.pk.0 as usize + 2] += 1;
             }
             for i in 2..np + 2 {
                 est[i] += est[i - 1];
             }
+            let sorted_e: &[PEv] = if exp == 11 || radix31(ea, eb, |e| e.ts) { &ea[..] } else { &eb[..] };
             ev.clear();
             ev.reserve(n_ev);
             unsafe {
                 let evp = ev.as_mut_ptr();
-                let mut k = 0usize;
-                for t in &pev {
-                    for e in t[b].iter() {
-                        let w = &mut est[*gi.get_unchecked(k) as usize + 1];
-                        *evp.add(*w as usize) = *e;
-                        *w += 1;
-                        k += 1;
-                    }
+                for e in sorted_e.iter() {
+                    let w = est.get_unchecked_mut(e.pk.0 as usize + 1);
+                    *evp.add(*w as usize) = *e;
+                    *w += 1;
                 }
                 ev.set_len(n_ev);
             }
-            // est[p]..est[p + 1] is person p's events. Clicks of persons with no events are
-            // dropped: they can never credit or assist a session.
-            cgi.clear();
-            let mut n_ck_kept = 0usize;
+            // est[p]..est[p + 1] is person p's events, in time order. Clicks of persons with no
+            // events are dropped: they can never credit or assist a session.
+            ca.clear();
             for t in &pck {
                 for c in t[b].iter() {
-                    let g = pidx.get(c.pk).unwrap_or(u32::MAX);
-                    n_ck_kept += (g != u32::MAX) as usize;
-                    cgi.push(g);
+                    if let Some(g) = pidx.get(c.pk) {
+                        ca.push(PCk { pk: K(g as u64), ck: c.ck, ts: c.ts, camp: c.camp });
+                    }
                 }
             }
+            let n_ck_kept = ca.len();
             cst.clear();
             cst.resize(np + 2, 0);
-            for &g in cgi.iter() {
-                if g != u32::MAX {
-                    cst[g as usize + 2] += 1;
-                }
+            for c in ca.iter() {
+                cst[c.pk.0 as usize + 2] += 1;
             }
             for i in 2..np + 2 {
                 cst[i] += cst[i - 1];
             }
+            let sorted_c: &[PCk] = if exp == 11 || radix31(ca, cb, |c| c.ts) { &ca[..] } else { &cb[..] };
             ck.clear();
             ck.reserve(n_ck_kept);
             unsafe {
                 let ckp = ck.as_mut_ptr();
-                let mut k = 0usize;
-                for t in &pck {
-                    for c in t[b].iter() {
-                        let g = *cgi.get_unchecked(k);
-                        k += 1;
-                        if g != u32::MAX {
-                            let w = &mut cst[g as usize + 1];
-                            *ckp.add(*w as usize) = *c;
-                            *w += 1;
-                        }
-                    }
+                for c in sorted_c.iter() {
+                    let w = cst.get_unchecked_mut(c.pk.0 as usize + 1);
+                    *ckp.add(*w as usize) = *c;
+                    *w += 1;
                 }
                 ck.set_len(n_ck_kept);
             }
-            let _ = n_ck;
+            if exp == 14 {
+                std::hint::black_box((ev.len(), ck.len()));
+                return Vec::new();
+            }
+            // Clicks with the same ts within a person must be ordered by click_id (the tie-break
+            // for crediting): fix up the (rare) runs of equal ts.
             for p in 0..np {
-                let evs = &mut ev[est[p] as usize..est[p + 1] as usize];
-                if exp != 11 {
-                    // No nested parallel sort here: while waiting on it, this thread could be
-                    // handed another bucket's task that needs the same scratch (a panic).
-                    // Biggest-first scheduling already starts the whale buckets immediately.
-                    sort_small_by(evs, |a, c| a.ts < c.ts, |v| {
-                        if v.len() >= RADIX_MIN {
-                            radix_sort_ts(v, rtmp)
-                        } else {
-                            v.sort_unstable_by_key(|e| e.ts)
-                        }
-                    });
-                }
                 let cks = &mut ck[cst[p] as usize..cst[p + 1] as usize];
-                if any_long {
-                    cks.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| cmp_keys(a.ck, c.ck, reg)));
-                } else if exp != 11 {
-                    sort_small_by(cks, |a, c| (a.ts, a.ck) < (c.ts, c.ck), |v| v.sort_unstable_by_key(|c| (c.ts, c.ck)));
+                let mut i = 1;
+                while i < cks.len() {
+                    if cks[i].ts != cks[i - 1].ts {
+                        i += 1;
+                        continue;
+                    }
+                    let st = i - 1;
+                    let mut en = i + 1;
+                    while en < cks.len() && cks[en].ts == cks[st].ts {
+                        en += 1;
+                    }
+                    if any_long {
+                        cks[st..en].sort_unstable_by(|a, c| cmp_keys(a.ck, c.ck, reg));
+                    } else {
+                        cks[st..en].sort_unstable_by_key(|c| c.ck);
+                    }
+                    i = en;
                 }
             }
             if exp == 12 {

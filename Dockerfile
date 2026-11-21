@@ -1,4 +1,4 @@
-# Profile-guided variant of the Dockerfile (swap it in as `Dockerfile` to use it).
+# Profile-guided build (the plain build is Dockerfile.plain).
 # The build downloads the track's public data generator, profiles the pipeline on a generated
 # sample, and rebuilds with that profile. Any failure in those steps falls back to the plain
 # build, so this never builds something worse than `Dockerfile`.
