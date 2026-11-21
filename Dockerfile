@@ -1,13 +1,15 @@
-# Shopping Sessions: native Rust pipeline.
-# Build stage compiles for the scorer's CPU family (Intel Xeon, Cascade Lake or newer: AVX-512).
+# Profile-guided variant of the Dockerfile (swap it in as `Dockerfile` to use it).
+# The build downloads the track's public data generator, profiles the pipeline on a generated
+# sample, and rebuilds with that profile. Any failure in those steps falls back to the plain
+# build, so this never builds something worse than `Dockerfile`.
 FROM rust:1-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+RUN rustup component add llvm-tools-preview || true
+COPY Cargo.toml Cargo.lock pgo-build.sh ./
 COPY src ./src
 ENV RUSTFLAGS="-C target-cpu=cascadelake"
-RUN cargo build --release --locked --bin fast
+RUN sh pgo-build.sh
 
-# Runtime: just the binary on a slim base (same glibc as the builder).
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/fast /app/fast
