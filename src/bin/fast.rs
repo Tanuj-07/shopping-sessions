@@ -161,6 +161,52 @@ fn compact_key(buf: &[u8], off: usize, len: usize) -> Option<K> {
     }
 }
 
+/// Compact keys for two IDs at once (each 1..=12 bytes): both 16-byte windows sit in one
+/// 32-byte register, so the checks and the base-37 conversion run once for the pair.
+/// Each result is None when that ID needs the fallback form.
+#[inline(always)]
+fn compact_key2(buf: &[u8], o1: usize, l1: usize, o2: usize, l2: usize) -> (Option<K>, Option<K>) {
+    debug_assert!((1..=12).contains(&l1) && (1..=12).contains(&l2));
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm256_set_m128i(
+            _mm_loadu_si128(buf.as_ptr().add(o2) as *const __m128i),
+            _mm_loadu_si128(buf.as_ptr().add(o1) as *const __m128i),
+        );
+        let iota = _mm256_setr_epi8(
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        );
+        let lens = _mm256_set_m128i(_mm_set1_epi8(l2 as i8), _mm_set1_epi8(l1 as i8));
+        let inlen = _mm256_cmpgt_epi8(lens, iota);
+        let isd = _mm256_and_si256(
+            _mm256_cmpgt_epi8(v, _mm256_set1_epi8(b'0' as i8 - 1)),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8(b'9' as i8 + 1), v),
+        );
+        let isa = _mm256_and_si256(
+            _mm256_cmpgt_epi8(v, _mm256_set1_epi8(b'a' as i8 - 1)),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8(b'z' as i8 + 1), v),
+        );
+        let lm = _mm256_movemask_epi8(inlen) as u32;
+        let okm = _mm256_movemask_epi8(_mm256_and_si256(_mm256_or_si256(isd, isa), inlen)) as u32;
+        let d = _mm256_add_epi8(_mm256_sub_epi8(v, _mm256_set1_epi8(86)), _mm256_and_si256(isd, _mm256_set1_epi8(39)));
+        let d = _mm256_and_si256(d, inlen);
+        let x = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0125)); // byte pairs (37, 1)
+        let y = _mm256_madd_epi16(x, _mm256_set1_epi32(0x0001_0559)); // word pairs (1369, 1)
+        let k1 = K((_mm256_extract_epi32(y, 0) as u32 as u64) * P8
+            + (_mm256_extract_epi32(y, 1) as u32 as u64) * P4
+            + _mm256_extract_epi32(y, 2) as u32 as u64);
+        let k2 = K((_mm256_extract_epi32(y, 4) as u32 as u64) * P8
+            + (_mm256_extract_epi32(y, 5) as u32 as u64) * P4
+            + _mm256_extract_epi32(y, 6) as u32 as u64);
+        let ok1 = (okm & 0xFFFF) == (lm & 0xFFFF);
+        let ok2 = (okm >> 16) == (lm >> 16);
+        return (if ok1 { Some(k1) } else { None }, if ok2 { Some(k2) } else { None });
+    }
+    #[allow(unreachable_code)]
+    (compact_key(buf, o1, l1), compact_key(buf, o2, l2))
+}
+
 fn decode_compact(k: K, out: &mut Vec<u8>) {
     let mut digs = [0u8; 12];
     let mut v = k.0;
@@ -917,6 +963,25 @@ impl TsParser {
         }
     }
 
+    /// Event ts and ingest_ts together. The common shape is two "YYYY-MM-DDTHH:MM:SSZ" with
+    /// the same date text: the date is then checked and converted once. Same results as two
+    /// `parse` calls, for every input.
+    #[inline(always)]
+    fn parse_pair(&mut self, t: &[u8], i: &[u8]) -> (Option<i64>, Option<i64>) {
+        if t.len() == 20 && i.len() == 20 && load8(t, 0) == load8(i, 0) && t[8] == i[8] && t[9] == i[9] && t[4] == b'-' {
+            let day = self.date(t);
+            let one = |b: &[u8]| -> Option<i64> {
+                if b[10] != b'T' || b[19] != b'Z' {
+                    return None;
+                }
+                let secs = hms(b, 11)?;
+                Some((day? * 86_400 + secs) * 1000)
+            };
+            return (one(t), one(i));
+        }
+        (self.parse(t), self.parse(i))
+    }
+
     #[inline(always)]
     fn parse(&mut self, b: &[u8]) -> Option<i64> {
         let n = b.len();
@@ -1559,16 +1624,30 @@ fn main() {
                 if es == ee {
                     return;
                 }
-                let ek = if exp == 5 { K(std::hint::black_box(es as u64 * 0x9E37_79B9 | 1)) } else { key_of(buf, es, ee - es, None) };
-                let ingest_ms = if exp == 3 { std::hint::black_box(ws + 5000) } else { tsp.parse(&buf[fb[3].0..fb[3].1]).unwrap_or(i64::MAX / 4) };
+                let (us, ue) = fb[1];
+                // Both IDs in one pass when both are short (always, in practice).
+                let (ek, uk_fast) = if exp == 5 {
+                    (K(std::hint::black_box(es as u64 * 0x9E37_79B9 | 1)), Some(K(std::hint::black_box(us as u64 | 1))))
+                } else if ee - es <= 12 && ue > us && ue - us <= 12 {
+                    let (a, b) = compact_key2(buf, es, ee - es, us, ue - us);
+                    (a.unwrap_or_else(|| key_of(buf, es, ee - es, None)), b)
+                } else {
+                    (key_of(buf, es, ee - es, None), None)
+                };
+                // Both timestamps together (shared date when they match).
+                let (ts_opt, ingest_opt) = if exp == 3 {
+                    (Some(std::hint::black_box(ws + 1000)), Some(std::hint::black_box(ws + 5000)))
+                } else {
+                    tsp.parse_pair(&buf[fb[2].0..fb[2].1], &buf[fb[3].0..fb[3].1])
+                };
+                let ingest_ms = ingest_opt.unwrap_or(i64::MAX / 4);
                 let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                 let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
                 'v: {
-                    let (us, ue) = fb[1];
                     if us == ue {
                         break 'v;
                     }
-                    let Some(ts) = (if exp == 3 { Some(std::hint::black_box(ws + 1000)) } else { tsp.parse(&buf[fb[2].0..fb[2].1]) }) else { break 'v };
+                    let Some(ts) = ts_opt else { break 'v };
                     if ts < ws || ts >= we {
                         break 'v;
                     }
@@ -1589,7 +1668,10 @@ fn main() {
                         let cat = prod_cat.get(&buf[ps..pe]).copied().unwrap_or(unknown_cat);
                         r.pc = price | (cat << 24);
                     }
-                    r.uk = if exp == 5 { K(std::hint::black_box(us as u64 | 1)) } else { key_of(buf, us, ue - us, Some(reg)) };
+                    r.uk = match uk_fast {
+                        Some(k) => k,
+                        None => key_of(buf, us, ue - us, Some(reg)),
+                    };
                     r.ts = (ts - base) as u32;
                 }
                 if exp == 1 {
@@ -2051,5 +2133,99 @@ mod tests {
             checked += 1;
         }
         eprintln!("checked {checked} timestamp strings ({base_n} real + mangled)");
+    }
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+
+    /// compact_key2 == two compact_key calls, and parse_pair == two parse calls, on real
+    /// dev-data fields and mangled variants of them.
+    #[test]
+    fn fused_paths_match_separate_paths() {
+        let dir = std::env::var("TS_TEST_DATA").unwrap_or_else(|_| "C:/dev/shopping-sessions/data/dev".into());
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for p in csv_files(&Path::new(&dir).join("events")) {
+            let buf = fs::read(p).unwrap();
+            for line in buf.split(|&c| c == b'\n').skip(1).take(60_000) {
+                let f: Vec<&[u8]> = line.split(|&c| c == b',').collect();
+                if f.len() == 7 {
+                    let strip = |v: &[u8]| if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' { v[1..v.len() - 1].to_vec() } else { v.to_vec() };
+                    ids.push(strip(f[0]));
+                    ids.push(strip(f[1]));
+                    pairs.push((strip(f[2]), strip(f[3])));
+                }
+            }
+        }
+        let mut rng: u64 = 0x9E37_79B9;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let alphabet = b"09azAZ_ \r\"-:TZ+.";
+        let n0 = ids.len();
+        for i in 0..n0 {
+            let mut a = ids[i].clone();
+            if !a.is_empty() {
+                let pos = (next() as usize) % a.len();
+                a[pos] = alphabet[(next() as usize) % alphabet.len()];
+            }
+            ids.push(a);
+        }
+        let p0 = pairs.len();
+        for i in 0..p0 {
+            let (mut t, mut g) = pairs[i].clone();
+            match next() % 4 {
+                0 => g = t.clone(), // identical
+                1 => {
+                    if t.len() > 12 {
+                        let pos = 11 + (next() as usize) % (t.len() - 11);
+                        t[pos] = alphabet[(next() as usize) % alphabet.len()];
+                    }
+                }
+                2 => {
+                    if !g.is_empty() {
+                        let pos = (next() as usize) % g.len();
+                        g[pos] = alphabet[(next() as usize) % alphabet.len()];
+                    }
+                }
+                _ => {}
+            }
+            pairs.push((t, g));
+        }
+        // IDs, two at a time, laid out like a line (with 16 bytes of slack after each).
+        let mut checked = 0;
+        for w in ids.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.is_empty() || b.is_empty() || a.len() > 12 || b.len() > 12 {
+                continue;
+            }
+            let mut buf = a.clone();
+            buf.push(b',');
+            let o2 = buf.len();
+            buf.extend_from_slice(b);
+            buf.extend_from_slice(&[b','; 32]);
+            let fused = compact_key2(&buf, 0, a.len(), o2, b.len());
+            let sep = (compact_key(&buf, 0, a.len()), compact_key(&buf, o2, b.len()));
+            assert_eq!(fused, sep, "ids {:?} {:?}", String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+            checked += 1;
+        }
+        let mut t1 = TsParser::new();
+        let mut t2 = TsParser::new();
+        for (i, (t, g)) in pairs.iter().enumerate() {
+            if i % 5000 == 0 {
+                t1 = TsParser::new();
+                t2 = TsParser::new();
+            }
+            let fused = t1.parse_pair(t, g);
+            let sep = (t2.parse(t), t2.parse(g));
+            assert_eq!(fused, sep, "pair {:?} {:?}", String::from_utf8_lossy(t), String::from_utf8_lossy(g));
+            checked += 1;
+        }
+        eprintln!("checked {checked} id pairs + timestamp pairs");
     }
 }
