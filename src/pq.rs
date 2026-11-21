@@ -12,6 +12,8 @@ pub enum Col<'a> {
     Date(Vec<i32>),
     /// Required INT64.
     I64(Vec<i64>),
+    /// Required INT32.
+    I32(Vec<i32>),
 }
 
 impl Col<'_> {
@@ -21,12 +23,13 @@ impl Col<'_> {
             Col::OptStr(v) => v.len(),
             Col::Date(v) => v.len(),
             Col::I64(v) => v.len(),
+            Col::I32(v) => v.len(),
         }
     }
     fn physical(&self) -> i32 {
         match self {
             Col::Str(_) | Col::OptStr(_) => 6, // BYTE_ARRAY
-            Col::Date(_) => 1,                 // INT32
+            Col::Date(_) | Col::I32(_) => 1,   // INT32
             Col::I64(_) => 2,                  // INT64
         }
     }
@@ -144,6 +147,7 @@ fn encode_values(col: &Col, out: &mut Vec<u8>) {
         // Fixed-width columns: PLAIN is the little-endian values back to back = one copy.
         Col::Date(v) => out.extend_from_slice(le_bytes(v)),
         Col::I64(v) => out.extend_from_slice(le_bytes(v)),
+        Col::I32(v) => out.extend_from_slice(le_bytes(v)),
     }
 }
 
@@ -173,6 +177,7 @@ fn encoded_len(col: &Col) -> usize {
         }
         Col::Date(v) => 4 * v.len(),
         Col::I64(v) => 8 * v.len(),
+        Col::I32(v) => 4 * v.len(),
     }
 }
 
@@ -231,7 +236,7 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
                 m.end();
                 m.end();
             }
-            Col::I64(_) => {}
+            Col::I64(_) | Col::I32(_) => {}
         }
         m.end();
     }

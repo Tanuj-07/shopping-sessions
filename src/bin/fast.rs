@@ -2535,28 +2535,35 @@ fn main() {
                     }
                 }
                 let uid: Vec<&[u8]> = spans.iter().map(|&(s, e)| &arena[s..e]).collect();
+                // Counts are bounded by the number of events (< 2^31), so INT32 always holds them;
+                // revenue is INT32 when every value fits, INT64 otherwise (any width is accepted).
                 let mut day = Vec::with_capacity(n);
-                let mut ses = Vec::with_capacity(n);
-                let mut evs = Vec::with_capacity(n);
-                let mut rev = Vec::with_capacity(n);
+                let mut ses: Vec<i32> = Vec::with_capacity(n);
+                let mut evs: Vec<i32> = Vec::with_capacity(n);
                 let mut top: Vec<Option<&[u8]>> = Vec::with_capacity(n);
+                let mut rev_fits = true;
                 for v in g {
                     for r in v.iter() {
                         day.push(r.day);
-                        ses.push(r.sessions);
-                        evs.push(r.events);
-                        rev.push(r.revenue);
+                        ses.push(r.sessions as i32);
+                        evs.push(r.events as i32);
+                        rev_fits &= r.revenue <= i32::MAX as i64;
                         top.push(if r.top == u16::MAX { None } else { Some(cat_names_ref[r.top as usize]) });
                     }
                 }
+                let rev = if rev_fits {
+                    Col::I32(g.iter().flat_map(|v| v.iter()).map(|r| r.revenue as i32).collect())
+                } else {
+                    Col::I64(g.iter().flat_map(|v| v.iter()).map(|r| r.revenue).collect())
+                };
                 pq::write(
                     &ud_dir_ref.join(format!("part-{k}.parquet")),
                     &[
                         ("user_id", Col::Str(uid)),
                         ("day", Col::Date(day)),
-                        ("sessions", Col::I64(ses)),
-                        ("events", Col::I64(evs)),
-                        ("revenue_cents", Col::I64(rev)),
+                        ("sessions", Col::I32(ses)),
+                        ("events", Col::I32(evs)),
+                        ("revenue_cents", rev),
                         ("top_category", Col::OptStr(top)),
                     ],
                 )
