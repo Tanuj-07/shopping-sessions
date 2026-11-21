@@ -1306,15 +1306,25 @@ impl SmallTab {
 
 // ---------------------------------------------------------------- records
 
-/// Event copy before dedup. ts == u32::MAX marks an invalid copy.
+/// Event copy before dedup (28 bytes). ts == u32::MAX marks an invalid copy.
 #[derive(Clone, Copy, Default)]
+#[repr(C, packed(4))]
 struct ERaw {
-    ek: K,
+    em: u64, // bmix(event key): equal iff the keys are equal; top bits pick the bucket, low bits the slot
     uk: K,
     ingest: u32,
     ts: u32,
     pc: u32, // price | cat << 24; 0 for view/cart
-    h: u32,  // low 32 bits of ek.mix(): dedup slot index without rehashing (was padding)
+}
+
+/// Invertible 64-bit mix (odd multiplies and xor-shifts), so it can stand in for the key
+/// itself. Maps 0 to 0 only, and no real key is 0.
+#[inline(always)]
+fn bmix(x: u64) -> u64 {
+    let mut m = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    m ^= m >> 32;
+    m = m.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    m ^ (m >> 32)
 }
 
 /// Person key -> small dense number for one bucket (open addressing, grows when needed).
@@ -2040,8 +2050,8 @@ fn main() {
                         // ingest_ts is whole seconds (F1), so ms / 1000 is exact; unsigned math
                         // is cheaper than div_euclid (values here are far above zero).
                         let ingest = ((ingest_ms as u64 / 1000) as i64 - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
-                        let hm = ek.mix();
-                        let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0, h: hm as u32 };
+                        let hm = bmix(ek.0);
+                        let mut r = ERaw { em: hm, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
                         'v: {
                             if us == ue {
                                 break 'v;
@@ -2121,21 +2131,22 @@ fn main() {
                 let i = base_i + j;
                 // Start loading the slot the record 8 ahead will probe.
                 if let Some(ahead) = chunk.get(j + 8) {
-                    prefetch(unsafe { slots.as_ptr().add((ahead.h as usize) & mask) });
+                    prefetch(unsafe { slots.as_ptr().add((ahead.em as usize) & mask) });
                 }
                 let packed = ((t as u32) << 26) | i as u32;
-                let mut s = (r.h as usize) & mask;
+                let (rem, ring) = (r.em, r.ingest);
+                let mut s = (rem as usize) & mask;
                 loop {
                     let sl = unsafe { slots.get_unchecked_mut(s) };
                     if sl.k.is_empty() {
-                        *sl = DSlot { k: r.ek, idx: packed, ingest: r.ingest };
+                        *sl = DSlot { k: K(rem), idx: packed, ingest: ring };
                         used.push(s as u32);
                         break;
                     }
-                    if sl.k == r.ek {
-                        if r.ingest < sl.ingest {
+                    if sl.k.0 == rem {
+                        if ring < sl.ingest {
                             sl.idx = packed;
-                            sl.ingest = r.ingest;
+                            sl.ingest = ring;
                         }
                         break;
                     }
