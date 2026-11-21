@@ -1511,7 +1511,7 @@ struct UdRow {
 // so those writes land in memory that is already faulted in (and the process touches far less
 // fresh memory, which is also what the OS tears down at exit).
 
-const BLOCK: usize = 8 << 10;
+const BLOCK: usize = 4 << 10;
 const SLAB: usize = 16 << 20;
 
 struct Pool {
@@ -1553,9 +1553,12 @@ fn pool_give(blocks: &[*mut u8]) {
 /// A growable sequence of `T` stored as a chain of pool blocks.
 struct Stream<T> {
     blocks: Vec<*mut u8>,
-    last: usize, // items in the last block
-    _t: std::marker::PhantomData<T>,
+    cur: *mut T, // next free slot in the last block
+    end: *mut T, // end of the last block
 }
+
+/// Bytes ahead of the write position to prefetch for writing (0 = off).
+const PFW: usize = 0;
 
 unsafe impl<T: Send> Send for Stream<T> {}
 unsafe impl<T: Sync> Sync for Stream<T> {}
@@ -1564,26 +1567,44 @@ impl<T: Copy> Stream<T> {
     const PER: usize = BLOCK / std::mem::size_of::<T>();
 
     fn new() -> Self {
-        Stream { blocks: Vec::new(), last: Self::PER, _t: std::marker::PhantomData }
+        Stream { blocks: Vec::new(), cur: std::ptr::null_mut(), end: std::ptr::null_mut() }
+    }
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let b = pool_take();
+        self.blocks.push(b);
+        self.cur = b as *mut T;
+        self.end = unsafe { self.cur.add(Self::PER) };
     }
     #[inline(always)]
     fn push(&mut self, v: T) {
-        if self.last == Self::PER {
-            self.blocks.push(pool_take());
-            self.last = 0;
+        if self.cur == self.end {
+            self.grow();
         }
         unsafe {
-            let b = *self.blocks.last().unwrap_unchecked() as *mut T;
-            b.add(self.last).write(v);
+            if PFW > 0 {
+                #[cfg(target_arch = "x86_64")]
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>((self.cur as *const i8).wrapping_add(PFW));
+            }
+            self.cur.write(v);
+            self.cur = self.cur.add(1);
         }
-        self.last += 1;
+    }
+    /// Items in the last block.
+    #[inline]
+    fn last(&self) -> usize {
+        match self.blocks.last() {
+            Some(&b) => (self.cur as usize - b as usize) / std::mem::size_of::<T>(),
+            None => 0,
+        }
     }
     #[inline]
     fn len(&self) -> usize {
         if self.blocks.is_empty() {
             0
         } else {
-            (self.blocks.len() - 1) * Self::PER + self.last
+            (self.blocks.len() - 1) * Self::PER + self.last()
         }
     }
     /// Item `i` (i < len).
@@ -1594,8 +1615,9 @@ impl<T: Copy> Stream<T> {
     /// The items, one slice per block.
     fn chunks(&self) -> impl Iterator<Item = &[T]> + '_ {
         let n = self.blocks.len();
+        let last = self.last();
         self.blocks.iter().enumerate().map(move |(k, &b)| unsafe {
-            std::slice::from_raw_parts(b as *const T, if k + 1 == n { self.last } else { Self::PER })
+            std::slice::from_raw_parts(b as *const T, if k + 1 == n { last } else { Self::PER })
         })
     }
     fn iter(&self) -> impl Iterator<Item = &T> + '_ {
