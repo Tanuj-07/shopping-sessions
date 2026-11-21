@@ -80,71 +80,132 @@ fn hash_seed(b: &[u8], mut seed: u64) -> u64 {
 
 // ---------------------------------------------------------------- keys
 
-/// (high, low) halves of a 128-bit key; derived order = numeric order.
+/// An exact 8-byte ID key.
+///
+/// Compact form (top bit 0): an ID of 1..=12 characters from [0-9a-z] as a base-37 number,
+/// big-endian, with the characters mapped '0'..'9' -> 1..10, 'a'..'z' -> 11..36 and unused
+/// trailing positions 0. Numeric order is then exactly byte-wise order, and equal keys are
+/// equal IDs. Every ID in the generated data has this form (<= 9 chars).
+///
+/// Fallback form (top bit 1): anything else (upper case, spaces, '\r', long IDs) becomes a
+/// 63-bit hash; its bytes go into a registry so ordering and output stay exact.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug, Hash)]
-struct K(u64, u64);
+struct K(u64);
+
+const FALLBACK: u64 = 1 << 63;
+const P4: u64 = 37 * 37 * 37 * 37;
+const P8: u64 = P4 * P4;
 
 impl K {
-    const EMPTY: K = K(0, 0);
+    const EMPTY: K = K(0);
     #[inline]
     fn is_empty(self) -> bool {
-        self.0 == 0 && self.1 == 0
+        self.0 == 0
     }
     #[inline]
     fn is_long(self) -> bool {
-        self.1 & 0xFF == 0xFF
+        self.0 & FALLBACK != 0
     }
     #[inline]
     fn mix(self) -> u64 {
-        mum(self.1 ^ 0x9E37_79B9_7F4A_7C15, self.0 ^ 0xD6E8_FEB8_6659_FD93)
+        mum(self.0 ^ 0x9E37_79B9_7F4A_7C15, 0xD6E8_FEB8_6659_FD93)
     }
 }
 
-#[inline]
-fn short_key(buf: &[u8], off: usize, len: usize) -> K {
-    let mut tmp = [0u8; 16];
-    if off + 16 <= buf.len() {
-        tmp.copy_from_slice(&buf[off..off + 16]);
-    } else {
-        tmp[..len].copy_from_slice(&buf[off..off + len]);
+/// Compact key for buf[off..off+len] (len >= 1), or None if it needs the fallback form.
+/// Reads 16 bytes from `off`; every caller's buffer has at least 16 bytes of slack.
+#[inline(always)]
+fn compact_key(buf: &[u8], off: usize, len: usize) -> Option<K> {
+    if len > 12 {
+        return None;
     }
-    let v = u128::from_be_bytes(tmp);
-    let v = (v & (!0u128 << (128 - 8 * len))) | len as u128;
-    K((v >> 64) as u64, v as u64)
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        debug_assert!(off + 16 <= buf.len());
+        let v = _mm_loadu_si128(buf.as_ptr().add(off) as *const __m128i);
+        let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let inlen = _mm_cmpgt_epi8(_mm_set1_epi8(len as i8), iota);
+        let isd = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(b'0' as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(b'9' as i8 + 1), v));
+        let isa = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(b'a' as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(b'z' as i8 + 1), v));
+        let lm = _mm_movemask_epi8(inlen);
+        if _mm_movemask_epi8(_mm_and_si128(_mm_or_si128(isd, isa), inlen)) != lm {
+            return None;
+        }
+        // letters: c - 86 (a -> 11); digits: c - 47 (0 -> 1) = (c - 86) + 39, all mod 256.
+        let d = _mm_add_epi8(_mm_sub_epi8(v, _mm_set1_epi8(86)), _mm_and_si128(isd, _mm_set1_epi8(39)));
+        let d = _mm_and_si128(d, inlen);
+        let x = _mm_maddubs_epi16(d, _mm_setr_epi8(37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1));
+        let y = _mm_madd_epi16(x, _mm_setr_epi16(1369, 1, 1369, 1, 1369, 1, 1369, 1));
+        let l0 = _mm_cvtsi128_si32(y) as u32 as u64;
+        let l1 = _mm_extract_epi32(y, 1) as u32 as u64;
+        let l2 = _mm_extract_epi32(y, 2) as u32 as u64;
+        return Some(K(l0 * P8 + l1 * P4 + l2));
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut v: u64 = 0;
+        for i in 0..12 {
+            let d = if i < len {
+                match buf[off + i] {
+                    c @ b'0'..=b'9' => (c - b'0' + 1) as u64,
+                    c @ b'a'..=b'z' => (c - b'a' + 11) as u64,
+                    _ => return None,
+                }
+            } else {
+                0
+            };
+            v = v * 37 + d;
+        }
+        Some(K(v))
+    }
 }
 
-fn long_key(b: &[u8]) -> K {
-    let h1 = hash_seed(b, 0x8ebc_6af0_9c88_c6e3);
-    let h2 = hash_seed(b, 0x5899_65cc_7537_4cc3);
-    K(h1, h2 | 0xFF)
+fn decode_compact(k: K, out: &mut Vec<u8>) {
+    let mut digs = [0u8; 12];
+    let mut v = k.0;
+    for i in (0..12).rev() {
+        digs[i] = (v % 37) as u8;
+        v /= 37;
+    }
+    for &d in &digs {
+        if d == 0 {
+            break;
+        }
+        out.push(if d <= 10 { b'0' + d - 1 } else { b'a' + d - 11 });
+    }
 }
 
-/// Bytes of long keys, for ordering and output.
+fn fallback_key(b: &[u8]) -> K {
+    K(FALLBACK | (hash_seed(b, 0x8ebc_6af0_9c88_c6e3) >> 1))
+}
+
+/// Bytes of fallback keys, for ordering and output.
 struct Reg(Mutex<FxHashMap<K, Vec<u8>>>);
 
-#[inline]
+#[inline(always)]
 fn key_of(buf: &[u8], off: usize, len: usize, reg: Option<&Reg>) -> K {
     if len == 0 {
-        K::EMPTY
-    } else if len <= 15 {
-        short_key(buf, off, len)
-    } else {
-        let b = &buf[off..off + len];
-        let k = long_key(b);
-        if let Some(r) = reg {
-            r.0.lock().unwrap().entry(k).or_insert_with(|| b.to_vec());
-        }
-        k
+        return K::EMPTY;
     }
+    if let Some(k) = compact_key(buf, off, len) {
+        return k;
+    }
+    let b = &buf[off..off + len];
+    let k = fallback_key(b);
+    if let Some(r) = reg {
+        r.0.lock().unwrap().entry(k).or_insert_with(|| b.to_vec());
+    }
+    k
 }
 
 fn key_bytes(k: K, reg: &Reg) -> Vec<u8> {
     if k.is_long() {
-        reg.0.lock().unwrap().get(&k).expect("long key registered").clone()
+        reg.0.lock().unwrap().get(&k).expect("fallback key registered").clone()
     } else {
-        let v = ((k.0 as u128) << 64) | k.1 as u128;
-        let len = (k.1 & 0xFF) as usize;
-        v.to_be_bytes()[..len].to_vec()
+        let mut v = Vec::with_capacity(12);
+        decode_compact(k, &mut v);
+        v
     }
 }
 
@@ -193,22 +254,22 @@ fn split<const N: usize>(line: &[u8], out: &mut [(usize, usize); N]) -> bool {
 /// Strip quotes from fields that are wrapped in them; false if the line breaks the quote rule.
 /// A quote may only open and close a whole field. Every field that starts with a quote must
 /// end with one; if the line holds any other quote, the count `nq` will not match.
+/// Branch-free: every field is checked the same way, no per-field if/else.
 #[inline(always)]
 fn fix_quotes<const N: usize>(buf: &[u8], fb: &mut [(usize, usize); N], nq: usize) -> bool {
-    let mut expect = 0;
+    let mut expect = 0usize;
+    let mut bad = false;
     for x in fb.iter_mut() {
         let (s, e) = *x;
-        if e > s && buf[s] == b'"' {
-            if e - s < 2 || buf[e - 1] != b'"' {
-                return false;
-            }
-            expect += 2;
-            *x = (s + 1, e - 1);
-        } else if e > s && buf[e - 1] == b'"' {
-            return false;
-        }
+        let nonempty = (e > s) as usize;
+        let qs = nonempty & (buf[s] == b'"') as usize;
+        let qe = nonempty & (buf[e - 1] == b'"') as usize;
+        // a quote must open and close the field, and `"` alone is not a quoted field
+        bad |= (qs != qe) | ((qs == 1) & (e - s < 2));
+        expect += 2 * qs;
+        *x = (s + qs, e - qs);
     }
-    expect == nq
+    !bad && expect == nq
 }
 
 thread_local! {
@@ -884,7 +945,7 @@ fn main() {
                             break;
                         }
                         if e.0.is_empty() {
-                            *e = (k, K(keys.len() as u64, 0));
+                            *e = (k, K(keys.len() as u64));
                             keys.push(k);
                             break;
                         }
@@ -969,7 +1030,7 @@ fn main() {
                 if es == ee {
                     return;
                 }
-                let ek = if ee - es <= 15 { short_key(buf, es, ee - es) } else { long_key(&buf[es..ee]) };
+                let ek = key_of(buf, es, ee - es, None);
                 let ingest_ms = if exp == 3 { std::hint::black_box(ws + 5000) } else { parse_ts(&buf[fb[3].0..fb[3].1]).unwrap_or(i64::MAX / 4) };
                 let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                 let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
@@ -1239,9 +1300,7 @@ fn main() {
                         if r.pk.is_long() {
                             arena.extend_from_slice(&key_bytes(r.pk, reg));
                         } else {
-                            let v = ((r.pk.0 as u128) << 64) | r.pk.1 as u128;
-                            let len = (r.pk.1 & 0xFF) as usize;
-                            arena.extend_from_slice(&v.to_be_bytes()[..len]);
+                            decode_compact(r.pk, &mut arena);
                         }
                         spans.push((s, arena.len()));
                     }
