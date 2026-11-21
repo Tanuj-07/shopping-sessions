@@ -919,18 +919,33 @@ fn mapped_chunk(m: &zc::Map, c: &Chunk) -> Option<(usize, usize)> {
     Some((first, end))
 }
 
+thread_local! {
+    /// This core's open handle for the file it read last (consecutive chunks of a core mostly
+    /// come from the same file; opening a file costs tens of microseconds on Windows).
+    static FH: RefCell<Option<(usize, fs::File)>> = const { RefCell::new(None) };
+}
+
 /// Read chunk `c` into `buf`; returns the byte range of its whole lines inside `buf`.
 fn load_chunk(path: &Path, size: usize, c: &Chunk, buf: &mut Vec<u8>) -> Option<(usize, usize)> {
+    FH.with(|fh| {
+        let mut fh = fh.borrow_mut();
+        if fh.as_ref().map(|h| h.0) != Some(c.file) {
+            *fh = Some((c.file, fs::File::open(path).unwrap()));
+        }
+        load_chunk_from(&fh.as_ref().unwrap().1, size, c, buf)
+    })
+}
+
+fn load_chunk_from(f: &fs::File, size: usize, c: &Chunk, buf: &mut Vec<u8>) -> Option<(usize, usize)> {
     // Start one byte early so we can see whether `start` begins a line.
     let r0 = c.start.max(1) - 1;
-    let f = fs::File::open(path).unwrap();
     let mut want = c.end - r0 + EXTRA;
     loop {
         let len = want.min(size - r0);
         if buf.len() < len + 16 {
             buf.resize(len + 16, 0); // grows only; zero-filled once per core
         }
-        let got = read_full(&f, &mut buf[..len], r0 as u64);
+        let got = read_full(f, &mut buf[..len], r0 as u64);
         let first = memchr(b'\n', &buf[..got])? + 1;
         if r0 + first >= c.end {
             return None; // no line starts inside this chunk
