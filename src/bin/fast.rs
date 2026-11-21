@@ -143,7 +143,6 @@ static GLOBAL: hugealloc::Huge = hugealloc::Huge;
 const DAY_MS: i64 = 86_400_000;
 const GAP_MS: u32 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const EB: u32 = 10; // event dedup bucket bits
 const PB: u32 = 10; // person bucket bits
 const LB: u32 = 8; // link id table bits
 const CHUNK: usize = 4 << 20;
@@ -1872,7 +1871,10 @@ fn main() {
     let reg = &reg;
     lap("setup");
 
-    let neb = 1usize << EB;
+    // Event dedup buckets: about 2.5-5 MB of input each (512 at 20M events, 1,024 at 60M), so a
+    // bucket's dedup table stays cache-sized while few pages are written to at once.
+    let eb: u32 = ((ev_bytes / (5 << 19)).max(1).ilog2()).clamp(6, 12);
+    let neb = 1usize << eb;
     let npb = 1usize << PB;
     let reserve = (ev_bytes / 80 / neb / nt) * 5 / 4 + 16;
     let exp: u32 = if cfg!(feature = "profile") { std::env::var("SS_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 };
@@ -2083,7 +2085,7 @@ fn main() {
                             std::hint::black_box(r);
                             return;
                         }
-                        unsafe { g.get_unchecked_mut((hm >> (64 - EB)) as usize) }.push(r);
+                        unsafe { g.get_unchecked_mut((hm >> (64 - eb)) as usize) }.push(r);
                     });
                 }));
             });
