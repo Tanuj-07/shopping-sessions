@@ -1726,12 +1726,27 @@ fn uf_find(p: &[AtomicU32], mut x: u32) -> u32 {
     }
 }
 
-fn csv_files(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = match fs::read_dir(dir) {
+/// The `*.csv` files of `dir` with their sizes, sorted by path. The directory listing already
+/// carries each entry's type (and on Windows its size), so most files need no extra lookup.
+fn csv_files(dir: &Path) -> Vec<(PathBuf, usize)> {
+    let mut v: Vec<(PathBuf, usize)> = match fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().map(|x| x == "csv").unwrap_or(false))
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().map(|x| x != "csv").unwrap_or(true) {
+                    return None;
+                }
+                let ft = e.file_type().ok()?;
+                let md = if ft.is_file() {
+                    e.metadata().ok()?
+                } else if ft.is_symlink() {
+                    fs::metadata(&p).ok().filter(|m| m.is_file())?
+                } else {
+                    return None;
+                };
+                Some((p, md.len() as usize))
+            })
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -1807,11 +1822,14 @@ fn main() {
     let day_lo = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - day_lo + 1).max(1) as usize;
 
-    let ev_files = csv_files(&data.join("events"));
-    let ck_files = csv_files(&data.join("clicks"));
-    let ln_files = csv_files(&data.join("links"));
-    let paths: Vec<PathBuf> = ev_files.iter().chain(&ck_files).chain(&ln_files).cloned().collect();
-    let sizes: Vec<usize> = paths.par_iter().map(|p| fs::metadata(p).unwrap().len() as usize).collect();
+    // Input listing on one core while another reads and indexes the small tables.
+    let ((ev_files, ck_files, ln_files), (products_buf, campaigns_buf)) = rayon::join(
+        || (csv_files(&data.join("events")), csv_files(&data.join("clicks")), csv_files(&data.join("links"))),
+        || (fs::read(data.join("products.csv")).expect("products"), fs::read(data.join("campaigns.csv")).expect("campaigns")),
+    );
+    let all_files: Vec<&(PathBuf, usize)> = ev_files.iter().chain(&ck_files).chain(&ln_files).collect();
+    let paths: Vec<PathBuf> = all_files.iter().map(|f| f.0.clone()).collect();
+    let sizes: Vec<usize> = all_files.iter().map(|f| f.1).collect();
     let (paths, sizes) = (&paths[..], &sizes[..]);
     let (ne, nc) = (ev_files.len(), ck_files.len());
     let ev_bytes: usize = sizes[..ne].iter().sum();
@@ -1836,16 +1854,23 @@ fn main() {
         })
     };
 
-    let products_buf = fs::read(data.join("products.csv")).expect("products");
-    let campaigns_buf = fs::read(data.join("campaigns.csv")).expect("campaigns");
-    let mut prod_raw: Vec<(&[u8], &[u8])> = Vec::new();
+    // Products: categories get numbers in first-seen order (a tiny map), then are renumbered
+    // so that number order is byte-wise name order (the top-category tie-break relies on it).
+    let mut prod_raw: Vec<(&[u8], u32)> = Vec::new();
+    let mut seen_cats: FxHashMap<&[u8], u32> = FxHashMap::default();
+    let mut seen_names: Vec<&[u8]> = Vec::new();
     let mut f2 = [(0usize, 0usize); 2];
     for line in small_lines(&products_buf) {
         if split(line, &mut f2) && f2[0].0 < f2[0].1 && f2[1].0 < f2[1].1 {
-            prod_raw.push((&line[f2[0].0..f2[0].1], &line[f2[1].0..f2[1].1]));
+            let c = &line[f2[1].0..f2[1].1];
+            let ci = *seen_cats.entry(c).or_insert_with(|| {
+                seen_names.push(c);
+                seen_names.len() as u32 - 1
+            });
+            prod_raw.push((&line[f2[0].0..f2[0].1], ci));
         }
     }
-    let mut cat_names: Vec<&[u8]> = prod_raw.iter().map(|p| p.1).collect();
+    let mut cat_names: Vec<&[u8]> = seen_names.clone();
     cat_names.push(b"unknown");
     cat_names.sort_unstable();
     cat_names.dedup();
@@ -1853,12 +1878,10 @@ fn main() {
     let ncat = cat_names.len();
     let cat_index = |c: &[u8]| cat_names.binary_search(&c).unwrap() as u32;
     let unknown_cat = cat_index(b"unknown");
-    // product_id is unique in products.csv; if it ever were not, keep the last row as before.
-    let mut prod_cat: FxHashMap<&[u8], u32> = FxHashMap::default();
-    for (p, c) in &prod_raw {
-        prod_cat.insert(p, cat_index(c));
-    }
-    let prod_items: Vec<(&[u8], u32)> = prod_cat.iter().map(|(p, c)| (*p, *c)).collect();
+    let renum: Vec<u32> = seen_names.iter().map(|c| cat_index(c)).collect();
+    // product_id is unique in products.csv; if it ever were not, the last row wins as before
+    // (the table keeps the first insert, so insert in reverse).
+    let prod_items: Vec<(&[u8], u32)> = prod_raw.iter().rev().map(|&(p, ci)| (p, renum[ci as usize])).collect();
     let prod_tab = SmallTab::new(&prod_items);
     let mut camp_ids: Vec<&[u8]> = Vec::new();
     let mut camp_chan: Vec<&[u8]> = Vec::new();
