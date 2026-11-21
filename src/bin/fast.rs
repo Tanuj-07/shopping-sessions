@@ -665,7 +665,7 @@ thread_local! {
     /// Per-core read buffer, reused for every chunk.
     static RBUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// Per-core dedup table (keys, record index), reused for every bucket.
-    static DSCR: RefCell<(Vec<DSlot>, Vec<(K, u32, u32)>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    static DSCR: RefCell<(Vec<DSlot>, Vec<(K, u32, u32)>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
     /// Per-core click staging buffer, reused for every chunk.
     static CSCR: RefCell<Vec<PCk>> = const { RefCell::new(Vec::new()) };
     /// Per-core write-combining slots for event parsing (measured: helps the 32-byte event
@@ -1702,8 +1702,9 @@ fn main() {
     let pev: PerThread<PEv> = PerThread::new(nt, npb, reserve);
     (0..neb).into_par_iter().for_each(|b| DSCR.with(|scr| {
         let mut scr = scr.borrow_mut();
-        let (slots, kept) = &mut *scr;
+        let (slots, kept, used) = &mut *scr;
         kept.clear();
+        used.clear();
         let parts: Vec<&[ERaw]> = stage1.iter().map(|t| &t[b][..]).collect();
         let n: usize = parts.iter().map(|p| p.len()).sum();
         let cap = ((n * 3) / 2).next_power_of_two().max(16);
@@ -1728,6 +1729,7 @@ fn main() {
                     let sl = unsafe { slots.get_unchecked_mut(s) };
                     if sl.k.is_empty() {
                         *sl = DSlot { k: r.ek, idx: packed, ingest: r.ingest };
+                        used.push(s as u32);
                         break;
                     }
                     if sl.k == r.ek {
@@ -1742,10 +1744,9 @@ fn main() {
             }
         }
         pev.with(|g| {
-            for sl in slots.iter_mut() {
-                if sl.k.is_empty() {
-                    continue;
-                }
+            // Visit only the slots that were filled (no scan over empty ones).
+            for &s in used.iter() {
+                let sl = unsafe { slots.get_unchecked_mut(s as usize) };
                 let idx = sl.idx;
                 *sl = DSlot::EMPTY; // reset while the line is in cache: next bucket starts clean
                 let r = get(idx);
