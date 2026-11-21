@@ -754,7 +754,7 @@ fn main() {
             (Sub { tab, mask }, keys)
         })
         .collect();
-    drop(lk);
+    std::mem::forget(lk); // freeing is pointless work: the OS reclaims it at exit
     let mut offs = Vec::with_capacity(nlb);
     let mut nid = 0usize;
     for b in &built {
@@ -794,7 +794,7 @@ fn main() {
             }
         }
     });
-    drop(edges);
+    std::mem::forget(edges); // freeing is pointless work: the OS reclaims it at exit
     pmap.subs.par_iter_mut().for_each(|s| {
         for e in s.tab.iter_mut() {
             if !e.0.is_empty() {
@@ -803,7 +803,7 @@ fn main() {
             }
         }
     });
-    drop(parent);
+    std::mem::forget(parent); // freeing is pointless work: the OS reclaims it at exit
     let pmap = &pmap;
     lap(&format!("links ({nid} ids)"));
 
@@ -906,7 +906,7 @@ fn main() {
             }
         });
     });
-    drop(stage1);
+    std::mem::forget(stage1); // freeing is pointless work: the OS reclaims it at exit
     let pev = pev.into_inner();
     lap("dedup");
 
@@ -1055,8 +1055,8 @@ fn main() {
             rows
         })
         .collect();
-    drop(pev);
-    drop(pck);
+    std::mem::forget(pev); // freeing is pointless work: the OS reclaims it at exit
+    std::mem::forget(pck); // freeing is pointless work: the OS reclaims it at exit
     lap("sessions");
 
     // ------------------------------------------------------------ 6. write
@@ -1171,6 +1171,9 @@ fn main() {
         });
     });
     lap("write");
+    // Output files are fully written and closed above. Exit now instead of unmapping
+    // the inputs and freeing every buffer; the OS reclaims all of it instantly.
+    std::process::exit(0);
 }
 
 /// Category with the highest sum (tie -> smallest index = byte-wise smallest name); resets the sums.
