@@ -1248,6 +1248,16 @@ impl SessScratch {
     }
 }
 
+/// TEMP profiling: records a sessions task's duration when dropped.
+struct TaskTimer<'a>(bool, Instant, usize, &'a Mutex<Vec<(f64, usize)>>);
+impl Drop for TaskTimer<'_> {
+    fn drop(&mut self) {
+        if self.0 {
+            self.3.lock().unwrap().push((self.1.elapsed().as_secs_f64(), self.2));
+        }
+    }
+}
+
 /// Insertion sort for the small per-person groups; big groups use the library sort.
 #[inline(always)]
 fn sort_small_by<T: Copy + Send>(v: &mut [T], less: impl Fn(&T, &T) -> bool + Sync, big: impl FnOnce(&mut [T])) {
@@ -1940,6 +1950,7 @@ fn main() {
     // ------------------------------------------------------------ 5. sessions
     let camp_acc: Vec<Mutex<Vec<[i64; 4]>>> = (0..nt).map(|_| Mutex::new(vec![[0i64; 4]; (ncamp + 1) * ndays])).collect();
     let any_long = !reg.0.lock().unwrap().is_empty();
+    let task_times: Mutex<Vec<(f64, usize)>> = Mutex::new(Vec::new()); // TEMP profiling (SS_EXP=13)
     // Biggest buckets first (whales, shared devices), one task each, so the long ones start
     // immediately and the small ones fill the gaps at the end.
     let mut order: Vec<usize> = (0..npb).collect();
@@ -1949,6 +1960,8 @@ fn main() {
         .par_iter()
         .with_max_len(1)
         .map(|&b| SSCR.with(|scr| {
+            let t_task = Instant::now();
+            let _tt = TaskTimer(exp == 13, t_task, b, &task_times);
             // Group this bucket's events and clicks by person (counting, no comparisons), then
             // sort only within each person. Person order does not matter for the output.
             let mut scr = scr.borrow_mut();
@@ -2049,8 +2062,11 @@ fn main() {
             let mut rows: Vec<UdRow> = Vec::new();
             let mut cacc_guard = camp_acc[rayon::current_thread_index().unwrap_or(0)].lock().unwrap();
             let cacc = &mut *cacc_guard;
-            let mut stamp = vec![u32::MAX; ncamp];
-            let mut sess_no: u32 = 0;
+            // Sliding 7-day click window per person: how many window clicks each campaign has,
+            // and the list of campaigns currently in the window (with each one's list position).
+            let mut ccount = vec![0u32; ncamp];
+            let mut cpos = vec![0u32; ncamp];
+            let mut active: Vec<u32> = Vec::new();
             let mut cats = vec![0i64; ncat];
             let mut touched: Vec<u16> = Vec::new();
 
@@ -2059,6 +2075,10 @@ fn main() {
                 let i = est[pi] as usize;
                 let j = est[pi + 1] as usize;
                 let pc = &ck[cst[pi] as usize..cst[pi + 1] as usize];
+                // Sessions come in time order, so the window [start - 7 days, start] only moves
+                // forward: clicks enter at `hi` and leave at `lo`.
+                let mut lo = 0usize;
+                let mut hi = 0usize;
 
                 let mut row: Option<UdRow> = None;
                 let mut s = i;
@@ -2095,11 +2115,37 @@ fn main() {
 
                     let di = (day - day_lo) as usize;
                     let lo_ts = start - WEEK_MS as u32;
-                    let hi = pc.partition_point(|c| c.ts <= start);
-                    let lo = pc[..hi].partition_point(|c| c.ts < lo_ts);
+                    while hi < pc.len() && pc[hi].ts <= start {
+                        let c = pc[hi].camp as usize;
+                        if ccount[c] == 0 {
+                            cpos[c] = active.len() as u32;
+                            active.push(c as u32);
+                        }
+                        ccount[c] += 1;
+                        hi += 1;
+                    }
+                    while lo < hi && pc[lo].ts < lo_ts {
+                        let c = pc[lo].camp as usize;
+                        ccount[c] -= 1;
+                        if ccount[c] == 0 {
+                            let at = cpos[c] as usize;
+                            let last = active.pop().unwrap();
+                            if at < active.len() {
+                                active[at] = last;
+                                cpos[last as usize] = at as u32;
+                            }
+                        }
+                        lo += 1;
+                    }
+                    // Credit: the latest click in the window; on a tie in ts, the smallest click_id
+                    // (clicks are sorted by (ts, click_id), so the first of the latest-ts run).
                     let credited = if hi > lo {
                         let mx = pc[hi - 1].ts;
-                        pc[pc[lo..hi].partition_point(|c| c.ts < mx) + lo].camp
+                        let mut k = hi - 1;
+                        while k > lo && pc[k - 1].ts == mx {
+                            k -= 1;
+                        }
+                        pc[k].camp
                     } else {
                         organic
                     };
@@ -2107,15 +2153,16 @@ fn main() {
                     a[0] += 1;
                     a[1] += purchased as i64;
                     a[2] += rev;
-                    sess_no += 1;
-                    for c in &pc[lo..hi] {
-                        if stamp[c.camp as usize] != sess_no {
-                            stamp[c.camp as usize] = sess_no;
-                            cacc[c.camp as usize * ndays + di][3] += 1;
-                        }
+                    // Every campaign with a click in the window assists once.
+                    for &c in active.iter() {
+                        cacc[c as usize * ndays + di][3] += 1;
                     }
                     s = e;
                 }
+                for &c in active.iter() {
+                    ccount[c as usize] = 0;
+                }
+                active.clear();
                 if let Some(mut r) = row {
                     r.top = top_cat(&mut cats, &mut touched);
                     rows.push(r);
@@ -2126,6 +2173,13 @@ fn main() {
         .collect();
     std::mem::forget(pev); // freeing is pointless work: the OS reclaims it at exit
     std::mem::forget(pck); // freeing is pointless work: the OS reclaims it at exit
+    if exp == 13 {
+        let mut v = task_times.lock().unwrap().clone();
+        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let sum: f64 = v.iter().map(|x| x.0).sum();
+        eprintln!("sessions tasks: {} total {:.3}s, mean {:.4}s, slowest: {:?}", v.len(), sum, sum / v.len() as f64,
+            v.iter().take(6).map(|x| format!("{:.4}s", x.0)).collect::<Vec<_>>());
+    }
     lap("sessions");
 
     // ------------------------------------------------------------ 6. write
