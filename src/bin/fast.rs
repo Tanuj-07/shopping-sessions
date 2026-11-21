@@ -1718,6 +1718,10 @@ fn main() {
         let get = |x: u32| unsafe { parts.get_unchecked((x >> 26) as usize).get_unchecked((x & ((1 << 26) - 1)) as usize) };
         for (t, part) in parts.iter().enumerate() {
             for (i, r) in part.iter().enumerate() {
+                // Start loading the slot the record 8 ahead will probe.
+                if let Some(ahead) = part.get(i + 8) {
+                    prefetch(unsafe { slots.as_ptr().add((ahead.ek.mix() as usize) & mask) });
+                }
                 let packed = ((t as u32) << 26) | i as u32;
                 let mut s = (r.ek.mix() as usize) & mask;
                 loop {
