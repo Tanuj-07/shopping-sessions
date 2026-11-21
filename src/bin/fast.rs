@@ -194,24 +194,34 @@ fn split<const N: usize>(line: &[u8], out: &mut [(usize, usize); N]) -> bool {
 #[inline(always)]
 fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut(&[(usize, usize); N])) {
     let mut fb = [(0usize, 0usize); N];
-    let mut line = |ls: usize, le: usize, cm: &[usize; N], nc: usize, quote: bool| {
+    let mut line = |ls: usize, le: usize, cm: &[usize; N], nc: usize, nq: usize| {
         if nc != N - 1 {
             return;
         }
-        if quote {
-            if !split(&buf[ls..le], &mut fb) {
+        fb[0] = (ls, cm[0]);
+        for i in 1..N - 1 {
+            fb[i] = (cm[i - 1] + 1, cm[i]);
+        }
+        fb[N - 1] = (cm[N - 2] + 1, le);
+        if nq != 0 {
+            // A quote may only open and close a whole field. Every field that starts with a
+            // quote must end with one; if the line holds any other quote, the counts differ.
+            let mut expect = 0;
+            for x in fb.iter_mut() {
+                let (s, e) = *x;
+                if e > s && buf[s] == b'"' {
+                    if e - s < 2 || buf[e - 1] != b'"' {
+                        return;
+                    }
+                    expect += 2;
+                    *x = (s + 1, e - 1);
+                } else if e > s && buf[e - 1] == b'"' {
+                    return;
+                }
+            }
+            if expect != nq {
                 return;
             }
-            for x in fb.iter_mut() {
-                x.0 += ls;
-                x.1 += ls;
-            }
-        } else {
-            fb[0] = (ls, cm[0]);
-            for i in 1..N - 1 {
-                fb[i] = (cm[i - 1] + 1, cm[i]);
-            }
-            fb[N - 1] = (cm[N - 2] + 1, le);
         }
         f(&fb);
     };
@@ -225,10 +235,10 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
     scan_scalar::<N>(buf, s, e, &mut line);
 }
 
-fn scan_scalar<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, usize, &[usize; N], usize, bool)) {
+fn scan_scalar<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, usize, &[usize; N], usize, usize)) {
     let mut cm = [0usize; N];
     let mut nc = 0usize;
-    let mut quote = false;
+    let mut nq = 0usize;
     let mut ls = s;
     for p in s..e {
         match buf[p] {
@@ -239,30 +249,30 @@ fn scan_scalar<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMu
                 nc += 1;
             }
             b'\n' => {
-                f(ls, p, &cm, nc, quote);
+                f(ls, p, &cm, nc, nq);
                 ls = p + 1;
                 nc = 0;
-                quote = false;
+                nq = 0;
             }
-            b'"' => quote = true,
+            b'"' => nq += 1,
             _ => {}
         }
     }
     if ls < e {
-        f(ls, e, &cm, nc, quote);
+        f(ls, e, &cm, nc, nq);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scan_avx2<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, usize, &[usize; N], usize, bool)) {
+unsafe fn scan_avx2<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, usize, &[usize; N], usize, usize)) {
     use std::arch::x86_64::*;
     let vnl = _mm256_set1_epi8(b'\n' as i8);
     let vcm = _mm256_set1_epi8(b',' as i8);
     let vqt = _mm256_set1_epi8(b'"' as i8);
     let mut cm = [0usize; N];
     let mut nc = 0usize;
-    let mut quote = false;
+    let mut nq = 0usize;
     let mut ls = s;
     let mut p = s;
     let mut tail = [0u8; 64];
@@ -297,18 +307,18 @@ unsafe fn scan_avx2<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl
                 }
                 nc += 1;
             } else if m_nl & bit != 0 {
-                f(ls, pos, &cm, nc, quote);
+                f(ls, pos, &cm, nc, nq);
                 ls = pos + 1;
                 nc = 0;
-                quote = false;
+                nq = 0;
             } else {
-                quote = true;
+                nq += 1;
             }
         }
         p += 64;
     }
     if ls < e {
-        f(ls, e, &cm, nc, quote);
+        f(ls, e, &cm, nc, nq);
     }
 }
 
@@ -847,15 +857,24 @@ fn main() {
     let neb = 1usize << EB;
     let reserve = (ev_bytes / 80 / neb / nt) * 5 / 4 + 16;
     let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
+    let exp: u32 = std::env::var("SS_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0); // TEMP profiling switch
     ev_chunks.par_iter().for_each(|c| {
         stage1.with(|g| with_chunk(c, &mut |buf, cs, ce| {
+            if exp == 4 {
+                std::hint::black_box(buf.len());
+                return;
+            }
             scan_fields::<7>(buf, cs, ce, |fb| {
+                if exp == 2 {
+                    std::hint::black_box(fb);
+                    return;
+                }
                 let (es, ee) = fb[0];
                 if es == ee {
                     return;
                 }
                 let ek = if ee - es <= 15 { short_key(buf, es, ee - es) } else { long_key(&buf[es..ee]) };
-                let ingest_ms = parse_ts(&buf[fb[3].0..fb[3].1]).unwrap_or(i64::MAX / 4);
+                let ingest_ms = if exp == 3 { std::hint::black_box(ws + 5000) } else { parse_ts(&buf[fb[3].0..fb[3].1]).unwrap_or(i64::MAX / 4) };
                 let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                 let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
                 'v: {
@@ -863,7 +882,7 @@ fn main() {
                     if us == ue {
                         break 'v;
                     }
-                    let Some(ts) = parse_ts(&buf[fb[2].0..fb[2].1]) else { break 'v };
+                    let Some(ts) = (if exp == 3 { Some(std::hint::black_box(ws + 1000)) } else { parse_ts(&buf[fb[2].0..fb[2].1]) }) else { break 'v };
                     if ts < ws || ts >= we {
                         break 'v;
                     }
@@ -886,6 +905,10 @@ fn main() {
                     }
                     r.uk = key_of(buf, us, ue - us, Some(reg));
                     r.ts = (ts - base) as u32;
+                }
+                if exp == 1 {
+                    std::hint::black_box(r);
+                    return;
                 }
                 unsafe { g.get_unchecked_mut((ek.mix() >> (64 - EB)) as usize) }.push(r);
             });
