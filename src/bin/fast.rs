@@ -540,7 +540,9 @@ thread_local! {
     /// Per-core read buffer, reused for every chunk.
     static RBUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// Per-core dedup table (keys, record index), reused for every bucket.
-    static DSCR: RefCell<(Vec<K>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    static DSCR: RefCell<(Vec<K>, Vec<u32>, Vec<(K, u32, u32)>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+    /// Per-core click staging buffer, reused for every chunk.
+    static CSCR: RefCell<Vec<PCk>> = const { RefCell::new(Vec::new()) };
     /// Per-core session sort buffers, reused for every bucket.
     static SSCR: RefCell<(Vec<PEv>, Vec<PCk>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
@@ -910,7 +912,25 @@ struct PMap {
     subs: Vec<Sub>,
 }
 
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    }
+}
+
 impl PMap {
+    /// Start loading the table slot `get(k)` will look at first.
+    #[inline(always)]
+    fn prefetch(&self, k: K) {
+        let h = k.mix();
+        let s = unsafe { self.subs.get_unchecked((h >> (64 - LB)) as usize) };
+        if !s.tab.is_empty() {
+            prefetch(unsafe { s.tab.as_ptr().add((h as usize) & s.mask) });
+        }
+    }
+
     #[inline]
     fn get(&self, k: K) -> K {
         let h = k.mix();
@@ -1253,7 +1273,8 @@ fn main() {
     let pev: PerThread<PEv> = PerThread::new(nt, npb, reserve);
     (0..neb).into_par_iter().for_each(|b| DSCR.with(|scr| {
         let mut scr = scr.borrow_mut();
-        let (keys, idx) = &mut *scr;
+        let (keys, idx, kept) = &mut *scr;
+        kept.clear();
         let parts: Vec<&[ERaw]> = stage1.iter().map(|t| &t[b][..]).collect();
         let n: usize = parts.iter().map(|p| p.len()).sum();
         let cap = (n * 2).next_power_of_two().max(16);
@@ -1297,8 +1318,25 @@ fn main() {
                 if r.ts == u32::MAX {
                     continue;
                 }
-                let pk = pmap.get(r.uk);
-                unsafe { g.get_unchecked_mut((pk.mix() >> (64 - PB)) as usize) }.push(PEv { pk, ts: r.ts, pc: r.pc });
+                kept.push((r.uk, r.ts, r.pc));
+            }
+            // Person lookups jump around a table far bigger than the CPU cache. Ask for the
+            // entry PF events ahead so the memory waits overlap instead of queueing up.
+            const PF: usize = 16;
+            for x in kept.iter().take(PF) {
+                pmap.prefetch(x.0);
+            }
+            for i in 0..kept.len() {
+                if i + PF < kept.len() {
+                    pmap.prefetch(kept[i + PF].0);
+                }
+                let (uk, ts, pc) = kept[i];
+                let pk = if exp == 7 { uk } else { pmap.get(uk) };
+                if exp == 8 {
+                    std::hint::black_box(pk);
+                    continue;
+                }
+                unsafe { g.get_unchecked_mut((pk.mix() >> (64 - PB)) as usize) }.push(PEv { pk, ts, pc });
             }
         });
     }));
@@ -1310,8 +1348,11 @@ fn main() {
     let ck_chunks = make_chunks(sizes, ne..ne + nc);
     let pck: PerThread<PCk> = PerThread::new(nt, npb, (ck_bytes / 45 / npb / nt) * 5 / 4 + 16);
     ck_chunks.par_iter().for_each(|c| {
-        pck.with(|g| with_chunk(c, &mut |buf, s0, e0| {
+        pck.with(|g| CSCR.with(|cs_| with_chunk(c, &mut |buf, s0, e0| {
+            let mut local = cs_.borrow_mut();
+            local.clear();
             let mut tsp = TsParser::new();
+            // Parse first (pk holds the user key for now)...
             scan_fields::<4>(buf, s0, e0, |fb| {
                 let (cs, ce) = fb[0];
                 let (us, ue) = fb[1];
@@ -1323,11 +1364,24 @@ fn main() {
                     return;
                 }
                 let Some(&camp) = camp_idx.get(&buf[fb[2].0..fb[2].1]) else { return };
-                let pk = pmap.get(key_of(buf, us, ue - us, Some(reg)));
+                let uk = key_of(buf, us, ue - us, Some(reg));
                 let ck = key_of(buf, cs, ce - cs, Some(reg));
-                unsafe { g.get_unchecked_mut((pk.mix() >> (64 - PB)) as usize) }.push(PCk { pk, ck, ts: (ts - base) as u32, camp });
+                local.push(PCk { pk: uk, ck, ts: (ts - base) as u32, camp });
             });
-        }));
+            // ...then map users to persons with the table entries prefetched ahead.
+            const PF: usize = 16;
+            for x in local.iter().take(PF) {
+                pmap.prefetch(x.pk);
+            }
+            for i in 0..local.len() {
+                if i + PF < local.len() {
+                    pmap.prefetch(local[i + PF].pk);
+                }
+                let mut r = local[i];
+                r.pk = pmap.get(r.pk);
+                unsafe { g.get_unchecked_mut((r.pk.mix() >> (64 - PB)) as usize) }.push(r);
+            }
+        })));
     });
     let pck = pck.into_inner();
     lap(&format!("clicks ({} chunks)", ck_chunks.len()));
