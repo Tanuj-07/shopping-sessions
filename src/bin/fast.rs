@@ -568,6 +568,67 @@ fn read_full(f: &fs::File, buf: &mut [u8], off: u64) -> usize {
     got
 }
 
+/// Linux: read input straight from the page cache through a read-only mapping instead of
+/// copying it into a buffer. Each chunk asks the kernel to map its own pages in bulk first
+/// (MADV_POPULATE_READ, Linux 5.14+; ignored if unsupported), so the 8 cores populate in
+/// parallel and no per-page faults happen during parsing.
+#[cfg(target_os = "linux")]
+mod zc {
+    pub struct Map {
+        pub ptr: *const u8,
+        pub len: usize,
+    }
+    unsafe impl Send for Map {}
+    unsafe impl Sync for Map {}
+
+    pub fn map(path: &std::path::Path, len: usize) -> Option<Map> {
+        use std::os::unix::io::AsRawFd;
+        if len == 0 || std::env::var_os("SS_NO_MMAP").is_some() {
+            return None;
+        }
+        let f = std::fs::File::open(path).ok()?;
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Map { ptr: p as *const u8, len })
+    }
+
+    /// Ask the kernel to map [from, to) of the file now (whole pages).
+    pub fn populate(m: &Map, from: usize, to: usize) {
+        const MADV_POPULATE_READ: libc::c_int = 22;
+        let page = 4096;
+        let a = from & !(page - 1);
+        let b = to.min(m.len);
+        if b > a {
+            unsafe {
+                libc::madvise(m.ptr.add(a) as *mut libc::c_void, b - a, MADV_POPULATE_READ);
+            }
+        }
+    }
+}
+
+/// Zero-copy variant of `load_chunk` over a mapped file. Returns None when the chunk needs
+/// the copying path: its lines run too close to the end of the file for the parsers' 16-byte
+/// over-reads, or it holds no line start.
+#[cfg(target_os = "linux")]
+fn mapped_chunk(m: &zc::Map, c: &Chunk) -> Option<(usize, usize)> {
+    let data = unsafe { std::slice::from_raw_parts(m.ptr, m.len) };
+    let r0 = c.start.max(1) - 1;
+    let limit = (c.end + EXTRA).min(m.len);
+    zc::populate(m, r0, limit);
+    let first = r0 + memchr(b'\n', &data[r0..limit])? + 1;
+    if first >= c.end {
+        return None;
+    }
+    let from = c.end - 1;
+    let end = from + memchr(b'\n', &data[from..limit])? + 1;
+    if end + 16 > m.len {
+        return None; // too close to the end of the file: use the copying path
+    }
+    Some((first, end))
+}
+
 /// Read chunk `c` into `buf`; returns the byte range of its whole lines inside `buf`.
 fn load_chunk(path: &Path, size: usize, c: &Chunk, buf: &mut Vec<u8>) -> Option<(usize, usize)> {
     // Start one byte early so we can see whether `start` begins a line.
@@ -1218,8 +1279,18 @@ fn main() {
     let (ne, nc) = (ev_files.len(), ck_files.len());
     let ev_bytes: usize = sizes[..ne].iter().sum();
     let ck_bytes: usize = sizes[ne..ne + nc].iter().sum();
-    // Run `f(buf, start, end)` over the whole lines of chunk `c`, in this core's reused buffer.
+    #[cfg(target_os = "linux")]
+    let maps: Vec<Option<zc::Map>> = paths.par_iter().zip(sizes.par_iter()).map(|(p, &n)| zc::map(p, n)).collect();
+    // Run `f(buf, start, end)` over the whole lines of chunk `c`: straight from the mapped file
+    // on Linux, otherwise (and for each file's last lines) in this core's reused buffer.
     let with_chunk = |c: &Chunk, f: &mut dyn FnMut(&[u8], usize, usize)| {
+        #[cfg(target_os = "linux")]
+        if let Some(m) = &maps[c.file] {
+            if let Some((s, e)) = mapped_chunk(m, c) {
+                f(unsafe { std::slice::from_raw_parts(m.ptr, m.len) }, s, e);
+                return;
+            }
+        }
         RBUF.with(|rb| {
             let mut rb = rb.borrow_mut();
             if let Some((s, e)) = load_chunk(&paths[c.file], sizes[c.file], c, &mut rb) {
