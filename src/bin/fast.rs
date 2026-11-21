@@ -1613,218 +1613,228 @@ fn main() {
     let reg = &reg;
     lap("setup");
 
-    // ------------------------------------------------------------ 1. links
-    let ln_chunks = make_chunks(sizes, ne + nc..paths.len());
-    let edges: Vec<Vec<(K, K)>> = ln_chunks
-        .par_iter()
-        .map(|c| {
-            let mut v = Vec::new();
-            with_chunk(c, &mut |buf, s, e| {
-                scan_fields::<2>(buf, s, e, |fb| {
-                    let (a0, a1) = fb[0];
-                    let (b0, b1) = fb[1];
-                    if a0 == a1 || b0 == b1 {
-                        return;
-                    }
-                    v.push((key_of(buf, a0, a1 - a0, Some(reg)), key_of(buf, b0, b1 - b0, Some(reg))));
-                });
-            });
-            v
-        })
-        .collect();
-    let nlb = 1usize << LB;
-    let lk: PerThread<K> = PerThread::new(nt, nlb, 0);
-    edges.par_iter().for_each(|v| {
-        lk.with(|g| {
-            for &(a, b) in v {
-                g[(a.mix() >> (64 - LB)) as usize].push(a);
-                g[(b.mix() >> (64 - LB)) as usize].push(b);
-            }
-        })
-    });
-    let lk = lk.into_inner();
-    // Per-sub tables with local index, then offset to global ids.
-    let mut built: Vec<(Sub, Vec<K>)> = (0..nlb)
-        .into_par_iter()
-        .map(|s| {
-            let n: usize = lk.iter().map(|t| t[s].len()).sum();
-            if n == 0 {
-                return (Sub { tab: Vec::new(), mask: 0 }, Vec::new());
-            }
-            let cap = (n * 2).next_power_of_two().max(4);
-            let mask = cap - 1;
-            let mut tab = vec![(K::EMPTY, K::EMPTY); cap];
-            let mut keys = Vec::new();
-            for t in &lk {
-                for &k in &t[s] {
-                    let mut i = (k.mix() as usize) & mask;
-                    loop {
-                        let e = &mut tab[i];
-                        if e.0 == k {
-                            break;
-                        }
-                        if e.0.is_empty() {
-                            *e = (k, K(keys.len() as u64));
-                            keys.push(k);
-                            break;
-                        }
-                        i = (i + 1) & mask;
-                    }
-                }
-            }
-            (Sub { tab, mask }, keys)
-        })
-        .collect();
-    std::mem::forget(lk); // freeing is pointless work: the OS reclaims it at exit
-    let mut offs = Vec::with_capacity(nlb);
-    let mut nid = 0usize;
-    for b in &built {
-        offs.push(nid);
-        nid += b.1.len();
-    }
-    built.par_iter_mut().zip(offs.par_iter()).for_each(|(b, &o)| {
-        for e in b.0.tab.iter_mut() {
-            if !e.0.is_empty() {
-                e.1 .0 += o as u64;
-            }
-        }
-    });
-    let mut ids: Vec<K> = Vec::with_capacity(nid);
-    for b in built.iter_mut() {
-        ids.append(&mut b.1);
-    }
-    let mut pmap = PMap { subs: built.into_iter().map(|b| b.0).collect() };
-    let parent: Vec<AtomicU32> = (0..nid as u32).map(AtomicU32::new).collect();
-    let ids_ref = &ids;
-    // Union so that each root is the person's byte-wise smallest id.
-    let less = |a: u32, b: u32| cmp_keys(ids_ref[a as usize], ids_ref[b as usize], reg) == Ordering::Less;
-    edges.par_iter().for_each(|v| {
-        for &(ka, kb) in v {
-            let mut a = pmap.get(ka).0 as u32;
-            let mut b = pmap.get(kb).0 as u32;
-            loop {
-                a = uf_find(&parent, a);
-                b = uf_find(&parent, b);
-                if a == b {
-                    break;
-                }
-                let (child, root) = if less(a, b) { (b, a) } else { (a, b) };
-                if parent[child as usize].compare_exchange(child, root, AcqRel, Relaxed).is_ok() {
-                    break;
-                }
-            }
-        }
-    });
-    std::mem::forget(edges); // freeing is pointless work: the OS reclaims it at exit
-    pmap.subs.par_iter_mut().for_each(|s| {
-        for e in s.tab.iter_mut() {
-            if !e.0.is_empty() {
-                let r = uf_find(&parent, e.1 .0 as u32);
-                e.1 = ids_ref[r as usize];
-            }
-        }
-    });
-    std::mem::forget(parent); // freeing is pointless work: the OS reclaims it at exit
-    let pmap = &pmap;
-    lap(&format!("links ({nid} ids)"));
-
-    // ------------------------------------------------------------ 2. events parse
-    let ev_chunks = make_chunks(sizes, 0..ne);
     let neb = 1usize << EB;
+    let npb = 1usize << PB;
     let reserve = (ev_bytes / 80 / neb / nt) * 5 / 4 + 16;
-    let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
     let exp: u32 = std::env::var("SS_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0); // TEMP profiling switch
     EXP_G.store(exp, Relaxed);
-    ev_chunks.par_iter().for_each(|c| {
-        stage1.with(|g| WC_E.with(|wcc| with_chunk(c, &mut |buf, cs, ce| {
-            if exp == 4 {
-                std::hint::black_box(buf.len());
-                return;
-            }
-            let mut wc = wcc.borrow_mut();
-            wc.ensure(neb);
-            let mut tsp = TsParser::new();
-            scan_fields::<7>(buf, cs, ce, |fb| {
-                if exp == 2 {
-                    std::hint::black_box(fb);
-                    return;
-                }
-                let (es, ee) = fb[0];
-                if es == ee {
-                    return;
-                }
-                let (us, ue) = fb[1];
-                // Both IDs in one pass when both are short (always, in practice).
-                let (ek, uk_fast) = if exp == 5 {
-                    (K(std::hint::black_box(es as u64 * 0x9E37_79B9 | 1)), Some(K(std::hint::black_box(us as u64 | 1))))
-                } else if ee - es <= 12 && ue > us && ue - us <= 12 {
-                    let (a, b) = compact_key2(buf, es, ee - es, us, ue - us);
-                    (a.unwrap_or_else(|| key_of(buf, es, ee - es, None)), b)
-                } else {
-                    (key_of(buf, es, ee - es, None), None)
-                };
-                // Both timestamps together (shared date when they match).
-                let (ts_opt, ingest_opt) = if exp == 3 {
-                    (Some(std::hint::black_box(ws + 1000)), Some(std::hint::black_box(ws + 5000)))
-                } else {
-                    tsp.parse_pair(&buf[fb[2].0..fb[2].1], &buf[fb[3].0..fb[3].1])
-                };
-                let ingest_ms = ingest_opt.unwrap_or(i64::MAX / 4);
-                let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
-                let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
-                'v: {
-                    if us == ue {
-                        break 'v;
+    let ev_chunk_count = make_chunks(sizes, 0..ne).len();
+    let ck_chunk_count = make_chunks(sizes, ne..ne + nc).len();
+
+    // Linked IDs do not depend on event parsing, so they run at the same time: the person
+    // map is ready long before the parse finishes.
+    let (pmap, stage1) = rayon::join(
+        || {
+            // ------------------------------------------------------------ 1. links
+            let ln_chunks = make_chunks(sizes, ne + nc..paths.len());
+            let edges: Vec<Vec<(K, K)>> = ln_chunks
+                .par_iter()
+                .map(|c| {
+                    let mut v = Vec::new();
+                    with_chunk(c, &mut |buf, s, e| {
+                        scan_fields::<2>(buf, s, e, |fb| {
+                            let (a0, a1) = fb[0];
+                            let (b0, b1) = fb[1];
+                            if a0 == a1 || b0 == b1 {
+                                return;
+                            }
+                            v.push((key_of(buf, a0, a1 - a0, Some(reg)), key_of(buf, b0, b1 - b0, Some(reg))));
+                        });
+                    });
+                    v
+                })
+                .collect();
+            let nlb = 1usize << LB;
+            let lk: PerThread<K> = PerThread::new(nt, nlb, 0);
+            edges.par_iter().for_each(|v| {
+                lk.with(|g| {
+                    for &(a, b) in v {
+                        g[(a.mix() >> (64 - LB)) as usize].push(a);
+                        g[(b.mix() >> (64 - LB)) as usize].push(b);
                     }
-                    let Some(ts) = ts_opt else { break 'v };
-                    if ts < ws || ts >= we {
-                        break 'v;
+                })
+            });
+            let lk = lk.into_inner();
+            // Per-sub tables with local index, then offset to global ids.
+            let mut built: Vec<(Sub, Vec<K>)> = (0..nlb)
+                .into_par_iter()
+                .map(|s| {
+                    let n: usize = lk.iter().map(|t| t[s].len()).sum();
+                    if n == 0 {
+                        return (Sub { tab: Vec::new(), mask: 0 }, Vec::new());
                     }
-                    let (ty, tye) = fb[4];
-                    let purchase = match tye - ty {
-                        4 => {
-                            let w = u32::from_le_bytes([buf[ty], buf[ty + 1], buf[ty + 2], buf[ty + 3]]);
-                            if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
-                                false
-                            } else {
-                                break 'v;
+                    let cap = (n * 2).next_power_of_two().max(4);
+                    let mask = cap - 1;
+                    let mut tab = vec![(K::EMPTY, K::EMPTY); cap];
+                    let mut keys = Vec::new();
+                    for t in &lk {
+                        for &k in &t[s] {
+                            let mut i = (k.mix() as usize) & mask;
+                            loop {
+                                let e = &mut tab[i];
+                                if e.0 == k {
+                                    break;
+                                }
+                                if e.0.is_empty() {
+                                    *e = (k, K(keys.len() as u64));
+                                    keys.push(k);
+                                    break;
+                                }
+                                i = (i + 1) & mask;
                             }
                         }
-                        8 if load8(buf, ty) == u64::from_le_bytes(*b"purchase") => true,
-                        _ => break 'v,
-                    };
-                    let (ps, pe) = fb[5];
-                    if ps == pe {
-                        break 'v;
                     }
-                    if ingest_ms - ts > DAY_MS {
-                        break 'v;
+                    (Sub { tab, mask }, keys)
+                })
+                .collect();
+            std::mem::forget(lk); // freeing is pointless work: the OS reclaims it at exit
+            let mut offs = Vec::with_capacity(nlb);
+            let mut nid = 0usize;
+            for b in &built {
+                offs.push(nid);
+                nid += b.1.len();
+            }
+            built.par_iter_mut().zip(offs.par_iter()).for_each(|(b, &o)| {
+                for e in b.0.tab.iter_mut() {
+                    if !e.0.is_empty() {
+                        e.1 .0 += o as u64;
                     }
-                    if purchase {
-                        let Some(price) = parse_price(&buf[fb[6].0..fb[6].1]) else { break 'v };
-                        let cat = prod_tab.get(buf, ps, pe - ps).unwrap_or(unknown_cat);
-                        r.pc = price | (cat << 24);
-                    }
-                    r.uk = match uk_fast {
-                        Some(k) => k,
-                        None => key_of(buf, us, ue - us, Some(reg)),
-                    };
-                    r.ts = (ts - base) as u32;
                 }
-                if exp == 1 {
-                    std::hint::black_box(r);
-                    return;
-                }
-                wc.push(g, (ek.mix() >> (64 - EB)) as usize, r);
             });
-        })));
-    });
-    stage1.flush_wc(&WC_E);
-    let stage1 = stage1.into_inner();
-    lap(&format!("events parse ({} chunks)", ev_chunks.len()));
+            let mut ids: Vec<K> = Vec::with_capacity(nid);
+            for b in built.iter_mut() {
+                ids.append(&mut b.1);
+            }
+            let mut pmap = PMap { subs: built.into_iter().map(|b| b.0).collect() };
+            let parent: Vec<AtomicU32> = (0..nid as u32).map(AtomicU32::new).collect();
+            let ids_ref = &ids;
+            // Union so that each root is the person's byte-wise smallest id.
+            let less = |a: u32, b: u32| cmp_keys(ids_ref[a as usize], ids_ref[b as usize], reg) == Ordering::Less;
+            edges.par_iter().for_each(|v| {
+                for &(ka, kb) in v {
+                    let mut a = pmap.get(ka).0 as u32;
+                    let mut b = pmap.get(kb).0 as u32;
+                    loop {
+                        a = uf_find(&parent, a);
+                        b = uf_find(&parent, b);
+                        if a == b {
+                            break;
+                        }
+                        let (child, root) = if less(a, b) { (b, a) } else { (a, b) };
+                        if parent[child as usize].compare_exchange(child, root, AcqRel, Relaxed).is_ok() {
+                            break;
+                        }
+                    }
+                }
+            });
+            std::mem::forget(edges); // freeing is pointless work: the OS reclaims it at exit
+            pmap.subs.par_iter_mut().for_each(|s| {
+                for e in s.tab.iter_mut() {
+                    if !e.0.is_empty() {
+                        let r = uf_find(&parent, e.1 .0 as u32);
+                        e.1 = ids_ref[r as usize];
+                    }
+                }
+            });
+            std::mem::forget(parent); // freeing is pointless work: the OS reclaims it at exit
+            pmap
+        },
+        || {
+            // ------------------------------------------------------------ 2. events parse
+            let ev_chunks = make_chunks(sizes, 0..ne);
+            let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
+            ev_chunks.par_iter().for_each(|c| {
+                stage1.with(|g| WC_E.with(|wcc| with_chunk(c, &mut |buf, cs, ce| {
+                    if exp == 4 {
+                        std::hint::black_box(buf.len());
+                        return;
+                    }
+                    let mut wc = wcc.borrow_mut();
+                    wc.ensure(neb);
+                    let mut tsp = TsParser::new();
+                    scan_fields::<7>(buf, cs, ce, |fb| {
+                        if exp == 2 {
+                            std::hint::black_box(fb);
+                            return;
+                        }
+                        let (es, ee) = fb[0];
+                        if es == ee {
+                            return;
+                        }
+                        let (us, ue) = fb[1];
+                        // Both IDs in one pass when both are short (always, in practice).
+                        let (ek, uk_fast) = if exp == 5 {
+                            (K(std::hint::black_box(es as u64 * 0x9E37_79B9 | 1)), Some(K(std::hint::black_box(us as u64 | 1))))
+                        } else if ee - es <= 12 && ue > us && ue - us <= 12 {
+                            let (a, b) = compact_key2(buf, es, ee - es, us, ue - us);
+                            (a.unwrap_or_else(|| key_of(buf, es, ee - es, None)), b)
+                        } else {
+                            (key_of(buf, es, ee - es, None), None)
+                        };
+                        // Both timestamps together (shared date when they match).
+                        let (ts_opt, ingest_opt) = if exp == 3 {
+                            (Some(std::hint::black_box(ws + 1000)), Some(std::hint::black_box(ws + 5000)))
+                        } else {
+                            tsp.parse_pair(&buf[fb[2].0..fb[2].1], &buf[fb[3].0..fb[3].1])
+                        };
+                        let ingest_ms = ingest_opt.unwrap_or(i64::MAX / 4);
+                        let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
+                        let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
+                        'v: {
+                            if us == ue {
+                                break 'v;
+                            }
+                            let Some(ts) = ts_opt else { break 'v };
+                            if ts < ws || ts >= we {
+                                break 'v;
+                            }
+                            let (ty, tye) = fb[4];
+                            let purchase = match tye - ty {
+                                4 => {
+                                    let w = u32::from_le_bytes([buf[ty], buf[ty + 1], buf[ty + 2], buf[ty + 3]]);
+                                    if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
+                                        false
+                                    } else {
+                                        break 'v;
+                                    }
+                                }
+                                8 if load8(buf, ty) == u64::from_le_bytes(*b"purchase") => true,
+                                _ => break 'v,
+                            };
+                            let (ps, pe) = fb[5];
+                            if ps == pe {
+                                break 'v;
+                            }
+                            if ingest_ms - ts > DAY_MS {
+                                break 'v;
+                            }
+                            if purchase {
+                                let Some(price) = parse_price(&buf[fb[6].0..fb[6].1]) else { break 'v };
+                                let cat = prod_tab.get(buf, ps, pe - ps).unwrap_or(unknown_cat);
+                                r.pc = price | (cat << 24);
+                            }
+                            r.uk = match uk_fast {
+                                Some(k) => k,
+                                None => key_of(buf, us, ue - us, Some(reg)),
+                            };
+                            r.ts = (ts - base) as u32;
+                        }
+                        if exp == 1 {
+                            std::hint::black_box(r);
+                            return;
+                        }
+                        wc.push(g, (ek.mix() >> (64 - EB)) as usize, r);
+                    });
+                })));
+            });
+            stage1.flush_wc(&WC_E);
+            stage1.into_inner()
+        },
+    );
+    let pmap = &pmap;
+    lap(&format!("links + events parse ({ev_chunk_count} chunks)"));
 
     // ------------------------------------------------------------ 3. dedup -> person buckets
-    let npb = 1usize << PB;
     let pev: PerThread<PEv> = PerThread::new(nt, npb, reserve);
     (0..neb).into_par_iter().for_each(|b| DSCR.with(|scr| {
         let mut scr = scr.borrow_mut();
@@ -1904,7 +1914,6 @@ fn main() {
     std::mem::forget(stage1); // freeing is pointless work: the OS reclaims it at exit
     let pev = pev.into_inner();
     lap("dedup");
-
     // ------------------------------------------------------------ 4. clicks
     let ck_chunks = make_chunks(sizes, ne..ne + nc);
     let pck: PerThread<PCk> = PerThread::new(nt, npb, (ck_bytes / 45 / npb / nt) * 5 / 4 + 16);
@@ -1945,7 +1954,7 @@ fn main() {
         })));
     });
     let pck = pck.into_inner();
-    lap(&format!("clicks ({} chunks)", ck_chunks.len()));
+    lap(&format!("clicks ({ck_chunk_count} chunks)"));
 
     // ------------------------------------------------------------ 5. sessions
     let camp_acc: Vec<Mutex<Vec<[i64; 4]>>> = (0..nt).map(|_| Mutex::new(vec![[0i64; 4]; (ncamp + 1) * ndays])).collect();
