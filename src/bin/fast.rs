@@ -274,7 +274,10 @@ fn fix_quotes<const N: usize>(buf: &[u8], fb: &mut [(usize, usize); N], nq: usiz
 
 thread_local! {
     /// Per-core scan index: separator positions, newline positions, quotes before each newline.
-    static SIDX: RefCell<(Vec<u32>, Vec<u32>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+    /// Plus two bitsets indexed by separator: a quote right after it (shifted by one, bit 0 =
+    /// a quote at the slab start) and a quote right before it.
+    static SIDX: RefCell<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u64>, Vec<u64>)> =
+        const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
 }
 
 static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10); // TEMP: tuning via SS_SLAB
@@ -287,11 +290,11 @@ static PF_G: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::ne
 fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut(&[(usize, usize); N])) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2") {
             let use512 = USE512.load(Relaxed);
             SIDX.with(|ix| {
                 let mut ix = ix.borrow_mut();
-                let (seps, nls, qs) = &mut *ix;
+                let (seps, nls, qs, qa, qb) = &mut *ix;
                 let mut p = s;
                 while p < e {
                     // A slab ends right after a newline (or at e), so no line crosses slabs.
@@ -309,12 +312,16 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
                     };
                     unsafe {
                         if use512 {
-                            index_slab_avx512(buf, p, q, seps, nls, qs)
+                            index_slab_avx512(buf, p, q, seps, nls, qs, qa, qb)
                         } else {
-                            index_slab_avx2(buf, p, q, seps, nls, qs)
+                            index_slab_avx2(buf, p, q, seps, nls, qs, qa, qb)
                         }
                     };
-                    walk_slab::<N>(buf, p, seps, nls, qs, &mut f);
+                    if EXP_G.load(Relaxed) != 10 {
+                        walk_slab::<N>(p, seps, nls, qs, qa, qb, &mut f);
+                    } else {
+                        std::hint::black_box((seps.len(), nls.len()));
+                    }
                     p = q;
                 }
             });
@@ -370,16 +377,53 @@ unsafe fn masks_avx512(ptr: *const u8) -> (u64, u64, u64) {
     )
 }
 
+/// OR `n` low bits of `bits` into bitset `bs` starting at bit `at` (bitset pre-zeroed).
+#[inline(always)]
+unsafe fn put_bits(bs: *mut u64, at: usize, bits: u64, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let (w, o) = (at >> 6, at & 63);
+    *bs.add(w) |= bits << o;
+    if o != 0 && o + n > 64 {
+        *bs.add(w + 1) |= bits >> (64 - o);
+    }
+}
+
 /// Pass 1: record every separator (comma or newline) position, and every newline position
 /// with the number of quotes before it, for buf[p..q]. Positions are relative to p.
+/// Also records, per separator, whether a quote sits right before / right after it, so pass 2
+/// can check quoting with bit operations instead of reading bytes.
 /// No per-character branching: set bits are written out unconditionally, four at a time.
 /// One body, two instruction sets: only the mask function differs.
 macro_rules! define_index_slab {
     ($name:ident, $features:literal, $masks:ident) => {
         #[cfg(target_arch = "x86_64")]
         #[target_feature(enable = $features)]
-        unsafe fn $name(buf: &[u8], p: usize, q: usize, seps: &mut Vec<u32>, nls: &mut Vec<u32>, qs: &mut Vec<u32>) {
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name(
+            buf: &[u8],
+            p: usize,
+            q: usize,
+            seps: &mut Vec<u32>,
+            nls: &mut Vec<u32>,
+            qs: &mut Vec<u32>,
+            qa: &mut Vec<u64>,
+            qb: &mut Vec<u64>,
+        ) {
+            use std::arch::x86_64::_pext_u64;
             let len = q - p;
+            let words = (len + 72) / 64 + 4;
+            qa.clear();
+            qa.resize(words, 0);
+            qb.clear();
+            qb.resize(words, 0);
+            let qap = qa.as_mut_ptr();
+            let qbp = qb.as_mut_ptr();
+            if len > 0 && buf[p] == b'"' {
+                *qap |= 1; // the slab's first line starts with a quote
+            }
+            let mut carry: u64 = 0; // quote in the last byte of the previous block
             seps.clear();
             nls.clear();
             qs.clear();
@@ -407,6 +451,13 @@ macro_rules! define_index_slab {
 
                 let sep = m_c | m_nl;
                 let cnt = sep.count_ones() as usize;
+                // Quote right after / right before each byte, packed in separator order.
+                let next_q = if off + 64 < len { (buf[p + off + 64] == b'"') as u64 } else { 0 };
+                let after = (m_q >> 1) | (next_q << 63);
+                let before = (m_q << 1) | carry;
+                carry = m_q >> 63;
+                put_bits(qap, ns + 1, _pext_u64(after, sep), cnt);
+                put_bits(qbp, ns, _pext_u64(before, sep), cnt);
                 let out = sp.add(ns);
                 let mut bits = sep;
                 let mut i = 0;
@@ -437,6 +488,7 @@ macro_rules! define_index_slab {
             // The file's last line may have no newline: end it with a virtual one.
             if len > 0 && buf[q - 1] != b'\n' {
                 *sp.add(ns) = len as u32;
+                put_bits(qbp, ns, (buf[q - 1] == b'"') as u64, 1);
                 ns += 1;
                 *np.add(nn) = len as u32;
                 *qp.add(nn) = qtot;
@@ -448,12 +500,32 @@ macro_rules! define_index_slab {
         }
     };
 }
-define_index_slab!(index_slab_avx2, "avx2", masks_avx2);
-define_index_slab!(index_slab_avx512, "avx2,avx512f,avx512bw", masks_avx512);
+define_index_slab!(index_slab_avx2, "avx2,bmi2", masks_avx2);
+define_index_slab!(index_slab_avx512, "avx2,bmi2,avx512f,avx512bw", masks_avx512);
 
 /// Pass 2: walk the lines. A line is well-formed exactly when its N-th separator is its newline.
+/// Quoting is decided per line with bit operations: field i starts with a quote iff a quote
+/// follows the separator before it, and ends with one iff a quote precedes the separator after
+/// it. The line is well-formed iff those two masks agree, every quoted field has at least two
+/// characters, and the line holds no other quotes (2 x quoted fields == quotes on the line).
 #[inline(always)]
-fn walk_slab<const N: usize>(buf: &[u8], p: usize, seps: &[u32], nls: &[u32], qs: &[u32], f: &mut impl FnMut(&[(usize, usize); N])) {
+#[allow(clippy::too_many_arguments)]
+fn walk_slab<const N: usize>(
+    p: usize,
+    seps: &[u32],
+    nls: &[u32],
+    qs: &[u32],
+    qa: &[u64],
+    qb: &[u64],
+    f: &mut impl FnMut(&[(usize, usize); N]),
+) {
+    #[inline(always)]
+    fn bits_at<const N: usize>(bs: &[u64], at: usize) -> u64 {
+        let (w, o) = (at >> 6, at & 63);
+        let lo = bs[w] >> o;
+        let hi = if o + N > 64 { bs[w + 1] << (64 - o) } else { 0 };
+        (lo | hi) & ((1u64 << N) - 1)
+    }
     let mut fb = [(0usize, 0usize); N];
     let mut k = 0usize;
     let mut ls = 0u32;
@@ -464,12 +536,18 @@ fn walk_slab<const N: usize>(buf: &[u8], p: usize, seps: &[u32], nls: &[u32], qs
         qprev = qs[j];
         if k + N - 1 < seps.len() && seps[k + N - 1] == le {
             let sv = &seps[k..k + N];
-            fb[0] = (p + ls as usize, p + sv[0] as usize);
-            for i in 1..N {
-                fb[i] = (p + sv[i - 1] as usize + 1, p + sv[i] as usize);
+            let sm = bits_at::<N>(qa, k);
+            let em = bits_at::<N>(qb, k);
+            let mut bad = (sm != em) | (2 * sm.count_ones() as usize != nq);
+            for i in 0..N {
+                let st = if i == 0 { p + ls as usize } else { p + sv[i - 1] as usize + 1 };
+                let en = p + sv[i] as usize;
+                let qf = ((sm >> i) & 1) as usize;
+                bad |= (qf == 1) & (en - st < 2);
+                fb[i] = (st + qf, en - qf);
             }
             k += N;
-            if nq == 0 || EXP_G.load(Relaxed) == 6 || fix_quotes(buf, &mut fb, nq) {
+            if !bad {
                 f(&fb);
             }
         } else {
