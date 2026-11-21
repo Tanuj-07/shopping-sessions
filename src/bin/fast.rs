@@ -12,6 +12,7 @@
 //!  5. each person bucket: sort, sessionize, attribute, aggregate
 //!  6. write Parquet files in parallel
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,6 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use memchr::memchr;
-use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use shopping_sessions::pq::{self, Col};
@@ -120,27 +120,27 @@ fn long_key(b: &[u8]) -> K {
 }
 
 /// Bytes of long keys, for ordering and output.
-struct Reg(Mutex<FxHashMap<K, u64>>);
+struct Reg(Mutex<FxHashMap<K, Vec<u8>>>);
 
 #[inline]
-fn key_of(bufs: &[&[u8]], f: usize, off: usize, len: usize, reg: Option<&Reg>) -> K {
+fn key_of(buf: &[u8], off: usize, len: usize, reg: Option<&Reg>) -> K {
     if len == 0 {
         K::EMPTY
     } else if len <= 15 {
-        short_key(bufs[f], off, len)
+        short_key(buf, off, len)
     } else {
-        let k = long_key(&bufs[f][off..off + len]);
+        let b = &buf[off..off + len];
+        let k = long_key(b);
         if let Some(r) = reg {
-            r.0.lock().unwrap().entry(k).or_insert(mkref(f, off, len));
+            r.0.lock().unwrap().entry(k).or_insert_with(|| b.to_vec());
         }
         k
     }
 }
 
-fn key_bytes(k: K, reg: &Reg, bufs: &[&[u8]]) -> Vec<u8> {
+fn key_bytes(k: K, reg: &Reg) -> Vec<u8> {
     if k.is_long() {
-        let r = *reg.0.lock().unwrap().get(&k).expect("long key registered");
-        deref(bufs, r).to_vec()
+        reg.0.lock().unwrap().get(&k).expect("long key registered").clone()
     } else {
         let v = ((k.0 as u128) << 64) | k.1 as u128;
         let len = (k.1 & 0xFF) as usize;
@@ -149,24 +149,12 @@ fn key_bytes(k: K, reg: &Reg, bufs: &[&[u8]]) -> Vec<u8> {
 }
 
 #[inline]
-fn cmp_keys(a: K, b: K, reg: &Reg, bufs: &[&[u8]]) -> Ordering {
+fn cmp_keys(a: K, b: K, reg: &Reg) -> Ordering {
     if !a.is_long() && !b.is_long() {
         a.cmp(&b)
     } else {
-        key_bytes(a, reg, bufs).cmp(&key_bytes(b, reg, bufs))
+        key_bytes(a, reg).cmp(&key_bytes(b, reg))
     }
-}
-
-#[inline]
-fn mkref(f: usize, off: usize, len: usize) -> u64 {
-    ((f as u64) << 48) | ((off as u64) << 16) | (len.min(0xffff) as u64)
-}
-#[inline]
-fn deref<'a>(bufs: &[&'a [u8]], r: u64) -> &'a [u8] {
-    let f = (r >> 48) as usize;
-    let off = ((r >> 16) & 0xffff_ffff) as usize;
-    let len = (r & 0xffff) as usize;
-    &bufs[f][off..off + len]
 }
 
 // ---------------------------------------------------------------- CSV scanning
@@ -324,27 +312,21 @@ unsafe fn scan_avx2<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl
     }
 }
 
+/// A byte range of one file. The chunk owns every line that starts inside [start, end)
+/// (the header, which starts at 0, is never owned), reading past `end` to finish its last line.
 struct Chunk {
     file: usize,
     start: usize,
     end: usize,
 }
 
-fn make_chunks(bufs: &[&[u8]], files: std::ops::Range<usize>) -> Vec<Chunk> {
+fn make_chunks(sizes: &[usize], files: std::ops::Range<usize>) -> Vec<Chunk> {
     let mut out = Vec::new();
     for f in files {
-        let m = bufs[f];
-        let n = m.len();
-        let Some(h) = memchr(b'\n', m) else { continue };
-        let mut s = h + 1;
+        let n = sizes[f];
+        let mut s = 0;
         while s < n {
-            let mut e = (s + CHUNK).min(n);
-            if e < n {
-                e = match memchr(b'\n', &m[e..]) {
-                    Some(p) => e + p + 1,
-                    None => n,
-                };
-            }
+            let e = (s + CHUNK).min(n);
             out.push(Chunk { file: f, start: s, end: e });
             s = e;
         }
@@ -352,6 +334,59 @@ fn make_chunks(bufs: &[&[u8]], files: std::ops::Range<usize>) -> Vec<Chunk> {
     // Biggest first helps the work-stealing balance at the end.
     out.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
     out
+}
+
+const EXTRA: usize = 64 << 10;
+
+thread_local! {
+    /// Per-core read buffer, reused for every chunk.
+    static RBUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Per-core dedup table (keys, record index), reused for every bucket.
+    static DSCR: RefCell<(Vec<K>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// Per-core session sort buffers, reused for every bucket.
+    static SSCR: RefCell<(Vec<PEv>, Vec<PCk>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+}
+
+fn read_full(f: &fs::File, buf: &mut [u8], off: u64) -> usize {
+    let mut got = 0;
+    while got < buf.len() {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[got..], off + got as u64);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[got..], off + got as u64);
+        match r {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+    got
+}
+
+/// Read chunk `c` into `buf`; returns the byte range of its whole lines inside `buf`.
+fn load_chunk(path: &Path, size: usize, c: &Chunk, buf: &mut Vec<u8>) -> Option<(usize, usize)> {
+    // Start one byte early so we can see whether `start` begins a line.
+    let r0 = c.start.max(1) - 1;
+    let f = fs::File::open(path).unwrap();
+    let mut want = c.end - r0 + EXTRA;
+    loop {
+        let len = want.min(size - r0);
+        if buf.len() < len + 16 {
+            buf.resize(len + 16, 0); // grows only; zero-filled once per core
+        }
+        let got = read_full(&f, &mut buf[..len], r0 as u64);
+        let first = memchr(b'\n', &buf[..got])? + 1;
+        if r0 + first >= c.end {
+            return None; // no line starts inside this chunk
+        }
+        let from = c.end - 1 - r0;
+        match memchr(b'\n', &buf[from..got]) {
+            Some(i) => return Some((first, from + i + 1)),
+            None if r0 + got >= size => return Some((first, got)),
+            None => want *= 2, // a very long last line: read further
+        }
+    }
 }
 
 // ---------------------------------------------------------------- timestamps
@@ -636,23 +671,21 @@ fn main() {
     let ev_files = csv_files(&data.join("events"));
     let ck_files = csv_files(&data.join("clicks"));
     let ln_files = csv_files(&data.join("links"));
-    let all: Vec<&PathBuf> = ev_files.iter().chain(&ck_files).chain(&ln_files).collect();
-    let maps: Vec<Option<Mmap>> = all
-        .par_iter()
-        .map(|p| {
-            let f = fs::File::open(p).unwrap();
-            if f.metadata().unwrap().len() == 0 {
-                None
-            } else {
-                Some(unsafe { Mmap::map(&f).unwrap() })
+    let paths: Vec<PathBuf> = ev_files.iter().chain(&ck_files).chain(&ln_files).cloned().collect();
+    let sizes: Vec<usize> = paths.par_iter().map(|p| fs::metadata(p).unwrap().len() as usize).collect();
+    let (paths, sizes) = (&paths[..], &sizes[..]);
+    let (ne, nc) = (ev_files.len(), ck_files.len());
+    let ev_bytes: usize = sizes[..ne].iter().sum();
+    let ck_bytes: usize = sizes[ne..ne + nc].iter().sum();
+    // Run `f(buf, start, end)` over the whole lines of chunk `c`, in this core's reused buffer.
+    let with_chunk = |c: &Chunk, f: &mut dyn FnMut(&[u8], usize, usize)| {
+        RBUF.with(|rb| {
+            let mut rb = rb.borrow_mut();
+            if let Some((s, e)) = load_chunk(&paths[c.file], sizes[c.file], c, &mut rb) {
+                f(&rb[..], s, e);
             }
         })
-        .collect();
-    let bufs: Vec<&[u8]> = maps.iter().map(|m| m.as_deref().unwrap_or(&[])).collect();
-    let bufs = &bufs[..];
-    let (ne, nc) = (ev_files.len(), ck_files.len());
-    let ev_bytes: usize = bufs[..ne].iter().map(|b| b.len()).sum();
-    let ck_bytes: usize = bufs[ne..ne + nc].iter().map(|b| b.len()).sum();
+    };
 
     let products_buf = fs::read(data.join("products.csv")).expect("products");
     let campaigns_buf = fs::read(data.join("campaigns.csv")).expect("campaigns");
@@ -695,18 +728,20 @@ fn main() {
     lap("setup");
 
     // ------------------------------------------------------------ 1. links
-    let ln_chunks = make_chunks(bufs, ne + nc..bufs.len());
+    let ln_chunks = make_chunks(sizes, ne + nc..paths.len());
     let edges: Vec<Vec<(K, K)>> = ln_chunks
         .par_iter()
         .map(|c| {
             let mut v = Vec::new();
-            scan_fields::<2>(bufs[c.file], c.start, c.end, |fb| {
-                let (a0, a1) = fb[0];
-                let (b0, b1) = fb[1];
-                if a0 == a1 || b0 == b1 {
-                    return;
-                }
-                v.push((key_of(bufs, c.file, a0, a1 - a0, Some(reg)), key_of(bufs, c.file, b0, b1 - b0, Some(reg))));
+            with_chunk(c, &mut |buf, s, e| {
+                scan_fields::<2>(buf, s, e, |fb| {
+                    let (a0, a1) = fb[0];
+                    let (b0, b1) = fb[1];
+                    if a0 == a1 || b0 == b1 {
+                        return;
+                    }
+                    v.push((key_of(buf, a0, a1 - a0, Some(reg)), key_of(buf, b0, b1 - b0, Some(reg))));
+                });
             });
             v
         })
@@ -776,7 +811,7 @@ fn main() {
     let parent: Vec<AtomicU32> = (0..nid as u32).map(AtomicU32::new).collect();
     let ids_ref = &ids;
     // Union so that each root is the person's byte-wise smallest id.
-    let less = |a: u32, b: u32| cmp_keys(ids_ref[a as usize], ids_ref[b as usize], reg, bufs) == Ordering::Less;
+    let less = |a: u32, b: u32| cmp_keys(ids_ref[a as usize], ids_ref[b as usize], reg) == Ordering::Less;
     edges.par_iter().for_each(|v| {
         for &(ka, kb) in v {
             let mut a = pmap.get(ka).0 as u32;
@@ -808,14 +843,13 @@ fn main() {
     lap(&format!("links ({nid} ids)"));
 
     // ------------------------------------------------------------ 2. events parse
-    let ev_chunks = make_chunks(bufs, 0..ne);
+    let ev_chunks = make_chunks(sizes, 0..ne);
     let neb = 1usize << EB;
     let reserve = (ev_bytes / 80 / neb / nt) * 5 / 4 + 16;
     let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
     ev_chunks.par_iter().for_each(|c| {
-        let buf = bufs[c.file];
-        stage1.with(|g| {
-            scan_fields::<7>(buf, c.start, c.end, |fb| {
+        stage1.with(|g| with_chunk(c, &mut |buf, cs, ce| {
+            scan_fields::<7>(buf, cs, ce, |fb| {
                 let (es, ee) = fb[0];
                 if es == ee {
                     return;
@@ -850,12 +884,12 @@ fn main() {
                         let cat = prod_cat.get(&buf[ps..pe]).copied().unwrap_or(unknown_cat);
                         r.pc = price | (cat << 24);
                     }
-                    r.uk = key_of(bufs, c.file, us, ue - us, Some(reg));
+                    r.uk = key_of(buf, us, ue - us, Some(reg));
                     r.ts = (ts - base) as u32;
                 }
                 unsafe { g.get_unchecked_mut((ek.mix() >> (64 - EB)) as usize) }.push(r);
             });
-        });
+        }));
     });
     let stage1 = stage1.into_inner();
     lap(&format!("events parse ({} chunks)", ev_chunks.len()));
@@ -863,13 +897,21 @@ fn main() {
     // ------------------------------------------------------------ 3. dedup -> person buckets
     let npb = 1usize << PB;
     let pev: PerThread<PEv> = PerThread::new(nt, npb, reserve);
-    (0..neb).into_par_iter().for_each(|b| {
+    (0..neb).into_par_iter().for_each(|b| DSCR.with(|scr| {
+        let mut scr = scr.borrow_mut();
+        let (keys, idx) = &mut *scr;
         let parts: Vec<&[ERaw]> = stage1.iter().map(|t| &t[b][..]).collect();
         let n: usize = parts.iter().map(|p| p.len()).sum();
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
-        let mut keys = vec![K::EMPTY; cap];
-        let mut idx = vec![0u32; cap];
+        // Reuse this core's table: clearing warm memory beats faulting in fresh pages.
+        if keys.len() < cap {
+            keys.resize(cap, K::EMPTY);
+            idx.resize(cap, 0);
+        }
+        let keys = &mut keys[..cap];
+        let idx = &mut idx[..cap];
+        keys.fill(K::EMPTY);
         let get = |x: u32| unsafe { parts.get_unchecked((x >> 26) as usize).get_unchecked((x & ((1 << 26) - 1)) as usize) };
         for (t, part) in parts.iter().enumerate() {
             for (i, r) in part.iter().enumerate() {
@@ -905,18 +947,17 @@ fn main() {
                 unsafe { g.get_unchecked_mut((pk.mix() >> (64 - PB)) as usize) }.push(PEv { pk, ts: r.ts, pc: r.pc });
             }
         });
-    });
+    }));
     std::mem::forget(stage1); // freeing is pointless work: the OS reclaims it at exit
     let pev = pev.into_inner();
     lap("dedup");
 
     // ------------------------------------------------------------ 4. clicks
-    let ck_chunks = make_chunks(bufs, ne..ne + nc);
+    let ck_chunks = make_chunks(sizes, ne..ne + nc);
     let pck: PerThread<PCk> = PerThread::new(nt, npb, (ck_bytes / 45 / npb / nt) * 5 / 4 + 16);
     ck_chunks.par_iter().for_each(|c| {
-        let buf = bufs[c.file];
-        pck.with(|g| {
-            scan_fields::<4>(buf, c.start, c.end, |fb| {
+        pck.with(|g| with_chunk(c, &mut |buf, s0, e0| {
+            scan_fields::<4>(buf, s0, e0, |fb| {
                 let (cs, ce) = fb[0];
                 let (us, ue) = fb[1];
                 if cs == ce || us == ue {
@@ -927,11 +968,11 @@ fn main() {
                     return;
                 }
                 let Some(&camp) = camp_idx.get(&buf[fb[2].0..fb[2].1]) else { return };
-                let pk = pmap.get(key_of(bufs, c.file, us, ue - us, Some(reg)));
-                let ck = key_of(bufs, c.file, cs, ce - cs, Some(reg));
+                let pk = pmap.get(key_of(buf, us, ue - us, Some(reg)));
+                let ck = key_of(buf, cs, ce - cs, Some(reg));
                 unsafe { g.get_unchecked_mut((pk.mix() >> (64 - PB)) as usize) }.push(PCk { pk, ck, ts: (ts - base) as u32, camp });
             });
-        });
+        }));
     });
     let pck = pck.into_inner();
     lap(&format!("clicks ({} chunks)", ck_chunks.len()));
@@ -941,26 +982,30 @@ fn main() {
     let any_long = !reg.0.lock().unwrap().is_empty();
     let ud: Vec<Vec<UdRow>> = (0..npb)
         .into_par_iter()
-        .map(|b| {
-            let mut ev: Vec<PEv> = Vec::with_capacity(pev.iter().map(|t| t[b].len()).sum());
+        .map(|b| SSCR.with(|scr| {
+            // This core's reused sort buffers and campaign tally.
+            let mut scr = scr.borrow_mut();
+            let (ev, ck) = &mut *scr;
+            ev.clear();
             for t in &pev {
                 ev.extend_from_slice(&t[b]);
             }
             ev.sort_unstable_by_key(|e| (e.pk, e.ts));
-            let mut ck: Vec<PCk> = Vec::with_capacity(pck.iter().map(|t| t[b].len()).sum());
+            ck.clear();
             for t in &pck {
                 ck.extend_from_slice(&t[b]);
             }
             if any_long {
                 ck.sort_unstable_by(|a, c| {
-                    a.pk.cmp(&c.pk).then(a.ts.cmp(&c.ts)).then_with(|| cmp_keys(a.ck, c.ck, reg, bufs))
+                    a.pk.cmp(&c.pk).then(a.ts.cmp(&c.ts)).then_with(|| cmp_keys(a.ck, c.ck, reg))
                 });
             } else {
                 ck.sort_unstable_by_key(|c| (c.pk, c.ts, c.ck));
             }
 
             let mut rows: Vec<UdRow> = Vec::new();
-            let mut cacc = vec![[0i64; 4]; (ncamp + 1) * ndays];
+            let mut cacc_guard = camp_acc[rayon::current_thread_index().unwrap_or(0)].lock().unwrap();
+            let cacc = &mut *cacc_guard;
             let mut stamp = vec![u32::MAX; ncamp];
             let mut sess_no: u32 = 0;
             let mut cats = vec![0i64; ncat];
@@ -1045,15 +1090,8 @@ fn main() {
                 }
                 i = j;
             }
-            let t = rayon::current_thread_index().unwrap_or(0);
-            let mut g = camp_acc[t].lock().unwrap();
-            for (x, y) in g.iter_mut().zip(&cacc) {
-                for k in 0..4 {
-                    x[k] += y[k];
-                }
-            }
             rows
-        })
+        }))
         .collect();
     std::mem::forget(pev); // freeing is pointless work: the OS reclaims it at exit
     std::mem::forget(pck); // freeing is pointless work: the OS reclaims it at exit
@@ -1080,7 +1118,7 @@ fn main() {
                     for r in v.iter() {
                         let s = arena.len();
                         if r.pk.is_long() {
-                            arena.extend_from_slice(&key_bytes(r.pk, reg, bufs));
+                            arena.extend_from_slice(&key_bytes(r.pk, reg));
                         } else {
                             let v = ((r.pk.0 as u128) << 64) | r.pk.1 as u128;
                             let len = (r.pk.1 & 0xFF) as usize;
