@@ -672,7 +672,7 @@ thread_local! {
     /// records, hurts the 16/24-byte ones, so only this writer uses it).
     static WC_E: RefCell<Wc<ERaw, 4>> = const { RefCell::new(Wc::new()) };
     /// Per-core session sort buffers, reused for every bucket.
-    static SSCR: RefCell<(Vec<PEv>, Vec<PCk>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    static SSCR: RefCell<SessScratch> = const { RefCell::new(SessScratch::new()) };
 }
 
 fn read_full(f: &fs::File, buf: &mut [u8], off: u64) -> usize {
@@ -1148,6 +1148,122 @@ struct ERaw {
     ingest: u32,
     ts: u32,
     pc: u32, // price | cat << 24; 0 for view/cart
+}
+
+/// Person key -> small dense number for one bucket (open addressing, grows when needed).
+struct PIdx {
+    tab: Vec<(K, u32)>,
+    mask: usize,
+    keys: Vec<K>,
+    used: Vec<u32>,
+}
+
+impl PIdx {
+    const fn new() -> Self {
+        PIdx { tab: Vec::new(), mask: 0, keys: Vec::new(), used: Vec::new() }
+    }
+    /// Empty the table (only the slots used last time) and size it for about `hint` persons.
+    fn reset(&mut self, hint: usize) {
+        for &u in &self.used {
+            self.tab[u as usize].0 = K::EMPTY;
+        }
+        self.used.clear();
+        self.keys.clear();
+        let cap = (hint * 2).next_power_of_two().max(64);
+        if self.tab.len() < cap {
+            self.tab.resize(cap, (K::EMPTY, 0));
+        }
+        self.mask = cap - 1;
+    }
+    fn grow(&mut self) {
+        for &u in &self.used {
+            self.tab[u as usize].0 = K::EMPTY;
+        }
+        self.used.clear();
+        let cap = (self.mask + 1) * 2;
+        if self.tab.len() < cap {
+            self.tab.resize(cap, (K::EMPTY, 0));
+        }
+        self.mask = cap - 1;
+        for (id, &k) in self.keys.iter().enumerate() {
+            let mut i = (k.mix() as usize) & self.mask;
+            while !self.tab[i].0.is_empty() {
+                i = (i + 1) & self.mask;
+            }
+            self.tab[i] = (k, id as u32);
+            self.used.push(i as u32);
+        }
+    }
+    #[inline(always)]
+    fn id(&mut self, k: K) -> u32 {
+        let mut i = (k.mix() as usize) & self.mask;
+        loop {
+            let e = unsafe { self.tab.get_unchecked_mut(i) };
+            if e.0 == k {
+                return e.1;
+            }
+            if e.0.is_empty() {
+                let id = self.keys.len() as u32;
+                *e = (k, id);
+                self.keys.push(k);
+                self.used.push(i as u32);
+                if self.keys.len() * 10 > (self.mask + 1) * 7 {
+                    self.grow();
+                }
+                return id;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn get(&self, k: K) -> Option<u32> {
+        let mut i = (k.mix() as usize) & self.mask;
+        loop {
+            let e = unsafe { self.tab.get_unchecked(i) };
+            if e.0 == k {
+                return Some(e.1);
+            }
+            if e.0.is_empty() {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// Per-core sessions scratch, reused for every bucket.
+struct SessScratch {
+    ev: Vec<PEv>,
+    ck: Vec<PCk>,
+    gi: Vec<u32>,
+    cgi: Vec<u32>,
+    est: Vec<u32>,
+    cst: Vec<u32>,
+    pidx: PIdx,
+}
+
+impl SessScratch {
+    const fn new() -> Self {
+        SessScratch { ev: Vec::new(), ck: Vec::new(), gi: Vec::new(), cgi: Vec::new(), est: Vec::new(), cst: Vec::new(), pidx: PIdx::new() }
+    }
+}
+
+/// Insertion sort for the small per-person groups; big groups use the library sort.
+#[inline(always)]
+fn sort_small_by<T: Copy + Send>(v: &mut [T], less: impl Fn(&T, &T) -> bool + Sync, big: impl FnOnce(&mut [T])) {
+    if v.len() <= 24 {
+        for i in 1..v.len() {
+            let x = v[i];
+            let mut j = i;
+            while j > 0 && less(&x, &v[j - 1]) {
+                v[j] = v[j - 1];
+                j -= 1;
+            }
+            v[j] = x;
+        }
+    } else {
+        big(v);
+    }
 }
 
 /// Dedup table slot: event key, where the kept copy is, and its ingest time (one cache access).
@@ -1833,26 +1949,97 @@ fn main() {
         .par_iter()
         .with_max_len(1)
         .map(|&b| SSCR.with(|scr| {
-            // This core's reused sort buffers and campaign tally.
+            // Group this bucket's events and clicks by person (counting, no comparisons), then
+            // sort only within each person. Person order does not matter for the output.
             let mut scr = scr.borrow_mut();
-            let (ev, ck) = &mut *scr;
-            ev.clear();
+            let SessScratch { ev, ck, gi, cgi, est, cst, pidx } = &mut *scr;
+            let n_ev: usize = pev.iter().map(|t| t[b].len()).sum();
+            let n_ck: usize = pck.iter().map(|t| t[b].len()).sum();
+            pidx.reset(n_ev / 16 + 16);
+            gi.clear();
             for t in &pev {
-                ev.extend_from_slice(&t[b]);
+                for e in t[b].iter() {
+                    gi.push(pidx.id(e.pk));
+                }
             }
-            if exp != 11 {
-                ev.sort_unstable_by_key(|e| (e.pk, e.ts));
+            let np = pidx.keys.len();
+            est.clear();
+            est.resize(np + 2, 0);
+            for &g in gi.iter() {
+                est[g as usize + 2] += 1;
+            }
+            for i in 2..np + 2 {
+                est[i] += est[i - 1];
+            }
+            ev.clear();
+            ev.reserve(n_ev);
+            unsafe {
+                let evp = ev.as_mut_ptr();
+                let mut k = 0usize;
+                for t in &pev {
+                    for e in t[b].iter() {
+                        let w = &mut est[*gi.get_unchecked(k) as usize + 1];
+                        *evp.add(*w as usize) = *e;
+                        *w += 1;
+                        k += 1;
+                    }
+                }
+                ev.set_len(n_ev);
+            }
+            // est[p]..est[p + 1] is person p's events. Clicks of persons with no events are
+            // dropped: they can never credit or assist a session.
+            cgi.clear();
+            let mut n_ck_kept = 0usize;
+            for t in &pck {
+                for c in t[b].iter() {
+                    let g = pidx.get(c.pk).unwrap_or(u32::MAX);
+                    n_ck_kept += (g != u32::MAX) as usize;
+                    cgi.push(g);
+                }
+            }
+            cst.clear();
+            cst.resize(np + 2, 0);
+            for &g in cgi.iter() {
+                if g != u32::MAX {
+                    cst[g as usize + 2] += 1;
+                }
+            }
+            for i in 2..np + 2 {
+                cst[i] += cst[i - 1];
             }
             ck.clear();
-            for t in &pck {
-                ck.extend_from_slice(&t[b]);
+            ck.reserve(n_ck_kept);
+            unsafe {
+                let ckp = ck.as_mut_ptr();
+                let mut k = 0usize;
+                for t in &pck {
+                    for c in t[b].iter() {
+                        let g = *cgi.get_unchecked(k);
+                        k += 1;
+                        if g != u32::MAX {
+                            let w = &mut cst[g as usize + 1];
+                            *ckp.add(*w as usize) = *c;
+                            *w += 1;
+                        }
+                    }
+                }
+                ck.set_len(n_ck_kept);
             }
-            if any_long {
-                ck.sort_unstable_by(|a, c| {
-                    a.pk.cmp(&c.pk).then(a.ts.cmp(&c.ts)).then_with(|| cmp_keys(a.ck, c.ck, reg))
-                });
-            } else if exp != 11 {
-                ck.sort_unstable_by_key(|c| (c.pk, c.ts, c.ck));
+            let _ = n_ck;
+            for p in 0..np {
+                let evs = &mut ev[est[p] as usize..est[p + 1] as usize];
+                if exp != 11 {
+                    // No nested parallel sort here: while waiting on it, this thread could be
+                    // handed another bucket's task that needs the same scratch (a panic).
+                    // Biggest-first scheduling already starts the whale buckets immediately.
+                    sort_small_by(evs, |a, c| a.ts < c.ts, |v| v.sort_unstable_by_key(|e| e.ts));
+                }
+                let cks = &mut ck[cst[p] as usize..cst[p + 1] as usize];
+                if any_long {
+                    cks.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| cmp_keys(a.ck, c.ck, reg)));
+                } else if exp != 11 {
+                    sort_small_by(cks, |a, c| (a.ts, a.ck) < (c.ts, c.ck), |v| v.sort_unstable_by_key(|c| (c.ts, c.ck)));
+                }
             }
             if exp == 12 {
                 std::hint::black_box((ev.len(), ck.len()));
@@ -1867,22 +2054,11 @@ fn main() {
             let mut cats = vec![0i64; ncat];
             let mut touched: Vec<u16> = Vec::new();
 
-            let mut ci = 0usize;
-            let mut i = 0usize;
-            while i < ev.len() {
-                let pk = ev[i].pk;
-                let mut j = i + 1;
-                while j < ev.len() && ev[j].pk == pk {
-                    j += 1;
-                }
-                while ci < ck.len() && ck[ci].pk < pk {
-                    ci += 1;
-                }
-                let mut cj = ci;
-                while cj < ck.len() && ck[cj].pk == pk {
-                    cj += 1;
-                }
-                let pc = &ck[ci..cj];
+            for pi in 0..np {
+                let pk = pidx.keys[pi];
+                let i = est[pi] as usize;
+                let j = est[pi + 1] as usize;
+                let pc = &ck[cst[pi] as usize..cst[pi + 1] as usize];
 
                 let mut row: Option<UdRow> = None;
                 let mut s = i;
@@ -1944,7 +2120,6 @@ fn main() {
                     r.top = top_cat(&mut cats, &mut touched);
                     rows.push(r);
                 }
-                i = j;
             }
             rows
         }))
