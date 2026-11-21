@@ -1387,8 +1387,9 @@ fn main() {
         if slots.len() < cap {
             slots.resize(cap, DSlot::EMPTY);
         }
+        // The table is always left all-empty by the previous bucket (the read pass below
+        // resets every slot it reads), so there is no separate clearing pass.
         let slots = &mut slots[..cap];
-        slots.fill(DSlot::EMPTY);
         let get = |x: u32| unsafe { parts.get_unchecked((x >> 26) as usize).get_unchecked((x & ((1 << 26) - 1)) as usize) };
         for (t, part) in parts.iter().enumerate() {
             for (i, r) in part.iter().enumerate() {
@@ -1412,11 +1413,13 @@ fn main() {
             }
         }
         pev.with(|g| {
-            for sl in slots.iter() {
+            for sl in slots.iter_mut() {
                 if sl.k.is_empty() {
                     continue;
                 }
-                let r = get(sl.idx);
+                let idx = sl.idx;
+                *sl = DSlot::EMPTY; // reset while the line is in cache: next bucket starts clean
+                let r = get(idx);
                 if r.ts == u32::MAX {
                     continue;
                 }
