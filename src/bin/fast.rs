@@ -190,9 +190,66 @@ fn split<const N: usize>(line: &[u8], out: &mut [(usize, usize); N]) -> bool {
     true
 }
 
+/// Strip quotes from fields that are wrapped in them; false if the line breaks the quote rule.
+/// A quote may only open and close a whole field. Every field that starts with a quote must
+/// end with one; if the line holds any other quote, the count `nq` will not match.
+#[inline(always)]
+fn fix_quotes<const N: usize>(buf: &[u8], fb: &mut [(usize, usize); N], nq: usize) -> bool {
+    let mut expect = 0;
+    for x in fb.iter_mut() {
+        let (s, e) = *x;
+        if e > s && buf[s] == b'"' {
+            if e - s < 2 || buf[e - 1] != b'"' {
+                return false;
+            }
+            expect += 2;
+            *x = (s + 1, e - 1);
+        } else if e > s && buf[e - 1] == b'"' {
+            return false;
+        }
+    }
+    expect == nq
+}
+
+thread_local! {
+    /// Per-core scan index: separator positions, newline positions, quotes before each newline.
+    static SIDX: RefCell<(Vec<u32>, Vec<u32>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+}
+
+static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10); // TEMP: tuning via SS_SLAB
+
 /// Calls `f(fields)` with absolute field ranges for every well-formed line of buf[s..e].
 #[inline(always)]
 fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut(&[(usize, usize); N])) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            SIDX.with(|ix| {
+                let mut ix = ix.borrow_mut();
+                let (seps, nls, qs) = &mut *ix;
+                let mut p = s;
+                while p < e {
+                    // A slab ends right after a newline (or at e), so no line crosses slabs.
+                    let lim = (p + SLAB_SZ.load(Relaxed)).min(e);
+                    let q = if lim == e {
+                        e
+                    } else {
+                        match memchr::memrchr(b'\n', &buf[p..lim]) {
+                            Some(i) => p + i + 1,
+                            None => match memchr(b'\n', &buf[lim..e]) {
+                                Some(i) => lim + i + 1,
+                                None => e,
+                            },
+                        }
+                    };
+                    unsafe { index_slab_avx2(buf, p, q, seps, nls, qs) };
+                    walk_slab::<N>(buf, p, seps, nls, qs, &mut f);
+                    p = q;
+                }
+            });
+            return;
+        }
+    }
     let mut fb = [(0usize, 0usize); N];
     let mut line = |ls: usize, le: usize, cm: &[usize; N], nc: usize, nq: usize| {
         if nc != N - 1 {
@@ -203,36 +260,131 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
             fb[i] = (cm[i - 1] + 1, cm[i]);
         }
         fb[N - 1] = (cm[N - 2] + 1, le);
-        if nq != 0 {
-            // A quote may only open and close a whole field. Every field that starts with a
-            // quote must end with one; if the line holds any other quote, the counts differ.
-            let mut expect = 0;
-            for x in fb.iter_mut() {
-                let (s, e) = *x;
-                if e > s && buf[s] == b'"' {
-                    if e - s < 2 || buf[e - 1] != b'"' {
-                        return;
-                    }
-                    expect += 2;
-                    *x = (s + 1, e - 1);
-                } else if e > s && buf[e - 1] == b'"' {
-                    return;
-                }
-            }
-            if expect != nq {
-                return;
-            }
+        if nq != 0 && !fix_quotes(buf, &mut fb, nq) {
+            return;
         }
         f(&fb);
     };
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") {
-            unsafe { scan_avx2::<N>(buf, s, e, &mut line) };
-            return;
-        }
-    }
     scan_scalar::<N>(buf, s, e, &mut line);
+}
+
+/// Pass 1: record every separator (comma or newline) position, and every newline position
+/// with the number of quotes before it, for buf[p..q]. Positions are relative to p.
+/// No per-character branching: set bits are written out unconditionally, four at a time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn index_slab_avx2(buf: &[u8], p: usize, q: usize, seps: &mut Vec<u32>, nls: &mut Vec<u32>, qs: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let len = q - p;
+    seps.clear();
+    nls.clear();
+    qs.clear();
+    seps.reserve(len + 72);
+    nls.reserve(len + 8);
+    qs.reserve(len + 8);
+    let sp = seps.as_mut_ptr();
+    let np = nls.as_mut_ptr();
+    let qp = qs.as_mut_ptr();
+    let (mut ns, mut nn) = (0usize, 0usize);
+    let mut qtot: u32 = 0;
+    let vnl = _mm256_set1_epi8(b'\n' as i8);
+    let vcm = _mm256_set1_epi8(b',' as i8);
+    let vqt = _mm256_set1_epi8(b'"' as i8);
+    let mut tail = [0u8; 64];
+    let mut off = 0usize;
+    while off < len {
+        let ptr = if off + 64 <= len {
+            buf.as_ptr().add(p + off)
+        } else {
+            let n = len - off;
+            tail[..n].copy_from_slice(&buf[p + off..q]);
+            tail[n..].fill(0);
+            tail.as_ptr()
+        };
+        let a = _mm256_loadu_si256(ptr as *const __m256i);
+        let b = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
+        let mask = |v: __m256i| -> u64 {
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64;
+            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64;
+            lo | (hi << 32)
+        };
+        let m_nl = mask(vnl);
+        let m_c = mask(vcm);
+        let m_q = mask(vqt);
+        let base = off as u32;
+
+        let sep = m_c | m_nl;
+        let cnt = sep.count_ones() as usize;
+        let out = sp.add(ns);
+        let mut bits = sep;
+        let mut i = 0;
+        while i < cnt {
+            *out.add(i) = base + bits.trailing_zeros();
+            bits &= bits.wrapping_sub(1);
+            *out.add(i + 1) = base + bits.trailing_zeros();
+            bits &= bits.wrapping_sub(1);
+            *out.add(i + 2) = base + bits.trailing_zeros();
+            bits &= bits.wrapping_sub(1);
+            *out.add(i + 3) = base + bits.trailing_zeros();
+            bits &= bits.wrapping_sub(1);
+            i += 4;
+        }
+        ns += cnt;
+
+        let mut bits = m_nl;
+        while bits != 0 {
+            let t = bits.trailing_zeros();
+            *np.add(nn) = base + t;
+            *qp.add(nn) = qtot + (m_q & ((1u64 << t) - 1)).count_ones();
+            nn += 1;
+            bits &= bits - 1;
+        }
+        qtot += m_q.count_ones();
+        off += 64;
+    }
+    // The file's last line may have no newline: end it with a virtual one.
+    if len > 0 && buf[q - 1] != b'\n' {
+        *sp.add(ns) = len as u32;
+        ns += 1;
+        *np.add(nn) = len as u32;
+        *qp.add(nn) = qtot;
+        nn += 1;
+    }
+    seps.set_len(ns);
+    nls.set_len(nn);
+    qs.set_len(nn);
+}
+
+/// Pass 2: walk the lines. A line is well-formed exactly when its N-th separator is its newline.
+#[inline(always)]
+fn walk_slab<const N: usize>(buf: &[u8], p: usize, seps: &[u32], nls: &[u32], qs: &[u32], f: &mut impl FnMut(&[(usize, usize); N])) {
+    let mut fb = [(0usize, 0usize); N];
+    let mut k = 0usize;
+    let mut ls = 0u32;
+    let mut qprev = 0u32;
+    for j in 0..nls.len() {
+        let le = nls[j];
+        let nq = (qs[j] - qprev) as usize;
+        qprev = qs[j];
+        if k + N - 1 < seps.len() && seps[k + N - 1] == le {
+            let sv = &seps[k..k + N];
+            fb[0] = (p + ls as usize, p + sv[0] as usize);
+            for i in 1..N {
+                fb[i] = (p + sv[i - 1] as usize + 1, p + sv[i] as usize);
+            }
+            k += N;
+            if nq == 0 || fix_quotes(buf, &mut fb, nq) {
+                f(&fb);
+            }
+        } else {
+            // Wrong number of commas: skip to just after this line's newline.
+            while seps[k] != le {
+                k += 1;
+            }
+            k += 1;
+        }
+        ls = le + 1;
+    }
 }
 
 fn scan_scalar<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, usize, &[usize; N], usize, usize)) {
@@ -257,65 +409,6 @@ fn scan_scalar<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMu
             b'"' => nq += 1,
             _ => {}
         }
-    }
-    if ls < e {
-        f(ls, e, &cm, nc, nq);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn scan_avx2<const N: usize>(buf: &[u8], s: usize, e: usize, f: &mut impl FnMut(usize, usize, &[usize; N], usize, usize)) {
-    use std::arch::x86_64::*;
-    let vnl = _mm256_set1_epi8(b'\n' as i8);
-    let vcm = _mm256_set1_epi8(b',' as i8);
-    let vqt = _mm256_set1_epi8(b'"' as i8);
-    let mut cm = [0usize; N];
-    let mut nc = 0usize;
-    let mut nq = 0usize;
-    let mut ls = s;
-    let mut p = s;
-    let mut tail = [0u8; 64];
-    while p < e {
-        let ptr = if p + 64 <= e {
-            buf.as_ptr().add(p)
-        } else {
-            let n = e - p;
-            tail[..n].copy_from_slice(&buf[p..e]);
-            tail[n..].fill(0);
-            tail.as_ptr()
-        };
-        let a = _mm256_loadu_si256(ptr as *const __m256i);
-        let b = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
-        let mask = |v: __m256i| -> u64 {
-            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64;
-            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64;
-            lo | (hi << 32)
-        };
-        let m_nl = mask(vnl);
-        let m_c = mask(vcm);
-        let m_q = mask(vqt);
-        let mut bits = m_nl | m_c | m_q;
-        while bits != 0 {
-            let i = bits.trailing_zeros() as usize;
-            let bit = 1u64 << i;
-            bits &= bits - 1;
-            let pos = p + i;
-            if m_c & bit != 0 {
-                if nc < N {
-                    *cm.get_unchecked_mut(nc) = pos;
-                }
-                nc += 1;
-            } else if m_nl & bit != 0 {
-                f(ls, pos, &cm, nc, nq);
-                ls = pos + 1;
-                nc = 0;
-                nq = 0;
-            } else {
-                nq += 1;
-            }
-        }
-        p += 64;
     }
     if ls < e {
         f(ls, e, &cm, nc, nq);
@@ -669,6 +762,9 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .clamp(1, 31);
     rayon::ThreadPoolBuilder::new().num_threads(nt).build_global().unwrap();
+    if let Some(v) = std::env::var("SS_SLAB").ok().and_then(|s| s.parse::<usize>().ok()) {
+        SLAB_SZ.store(v << 10, Relaxed);
+    }
 
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_value(&manifest, "window_start");
