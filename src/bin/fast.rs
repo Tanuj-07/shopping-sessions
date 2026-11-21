@@ -208,17 +208,31 @@ fn compact_key2(buf: &[u8], o1: usize, l1: usize, o2: usize, l2: usize) -> (Opti
 }
 
 fn decode_compact(k: K, out: &mut Vec<u8>) {
-    let mut digs = [0u8; 12];
-    let mut v = k.0;
-    for i in (0..12).rev() {
-        digs[i] = (v % 37) as u8;
-        v /= 37;
-    }
-    for &d in &digs {
-        if d == 0 {
-            break;
+    // Two base-37 digits per step (6 divisions by 1369 instead of 12 by 37).
+    #[inline(always)]
+    fn ch(d: u64) -> u8 {
+        if d <= 10 {
+            b'0' + d as u8 - 1
+        } else {
+            b'a' + d as u8 - 11
         }
-        out.push(if d <= 10 { b'0' + d - 1 } else { b'a' + d - 11 });
+    }
+    let mut pairs = [0u16; 6];
+    let mut v = k.0;
+    for i in (0..6).rev() {
+        pairs[i] = (v % 1369) as u16;
+        v /= 1369;
+    }
+    for &pr in &pairs {
+        let (hi, lo) = ((pr / 37) as u64, (pr % 37) as u64);
+        if hi == 0 {
+            return;
+        }
+        out.push(ch(hi));
+        if lo == 0 {
+            return;
+        }
+        out.push(ch(lo));
     }
 }
 

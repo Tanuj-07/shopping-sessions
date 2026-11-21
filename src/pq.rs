@@ -141,33 +141,53 @@ fn encode_values(col: &Col, out: &mut Vec<u8>) {
                 out.extend_from_slice(s);
             }
         }
-        Col::Date(v) => {
-            for x in v {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
+        // Fixed-width columns: PLAIN is the little-endian values back to back = one copy.
+        Col::Date(v) => out.extend_from_slice(le_bytes(v)),
+        Col::I64(v) => out.extend_from_slice(le_bytes(v)),
+    }
+}
+
+/// The values' bytes as stored (x86-64 is little-endian, which is what PLAIN wants).
+fn le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    #[cfg(target_endian = "big")]
+    compile_error!("PLAIN encoding here assumes a little-endian target");
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn varint_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// Exact size of `encode_values(col)`, so the page header can go first without a temp buffer.
+fn encoded_len(col: &Col) -> usize {
+    match col {
+        Col::Str(v) => v.iter().map(|s| 4 + s.len()).sum(),
+        Col::OptStr(v) => {
+            let groups = v.len().div_ceil(8);
+            4 + varint_len(((groups as u64) << 1) | 1) + groups + v.iter().flatten().map(|s| 4 + s.len()).sum::<usize>()
         }
-        Col::I64(v) => {
-            for x in v {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-        }
+        Col::Date(v) => 4 * v.len(),
+        Col::I64(v) => 8 * v.len(),
     }
 }
 
 pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()> {
     let rows = cols.first().map(|c| c.1.len()).unwrap_or(0);
-    let mut out: Vec<u8> = Vec::new();
+    let sizes: Vec<usize> = cols.iter().map(|(_, c)| encoded_len(c)).collect();
+    let mut out: Vec<u8> = Vec::with_capacity(sizes.iter().sum::<usize>() + 64 * cols.len() + 4096);
     out.extend_from_slice(b"PAR1");
     let mut chunks: Vec<(i64, i64)> = Vec::new(); // (offset, total size)
-    let mut data = Vec::new();
-    for (_, col) in cols {
+    for ((_, col), &dlen) in cols.iter().zip(&sizes) {
         assert_eq!(col.len(), rows);
-        data.clear();
-        encode_values(col, &mut data);
         let mut h = Thrift::new();
         h.i32(1, 0); // DATA_PAGE
-        h.i32(2, data.len() as i32);
-        h.i32(3, data.len() as i32);
+        h.i32(2, dlen as i32);
+        h.i32(3, dlen as i32);
         h.begin(5); // DataPageHeader
         h.i32(1, rows as i32);
         h.i32(2, 0); // PLAIN
@@ -177,8 +197,11 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
         h.stop();
         let off = out.len() as i64;
         out.extend_from_slice(&h.buf);
-        out.extend_from_slice(&data);
-        chunks.push((off, (h.buf.len() + data.len()) as i64));
+        let before = out.len();
+        encode_values(col, &mut out); // straight into the file buffer
+        debug_assert_eq!(out.len() - before, dlen);
+        assert_eq!(out.len() - before, dlen, "encoded size mismatch");
+        chunks.push((off, (h.buf.len() + dlen) as i64));
     }
 
     let mut m = Thrift::new();
