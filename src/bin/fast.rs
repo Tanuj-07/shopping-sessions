@@ -359,6 +359,14 @@ fn split<const N: usize>(line: &[u8], out: &mut [(usize, usize); N]) -> bool {
     true
 }
 
+/// Field bytes buf[r.0..r.1]. The ranges come from our own scanner and always lie inside
+/// `buf`, so the hot paths skip the bounds check.
+#[inline(always)]
+fn fld(buf: &[u8], r: (usize, usize)) -> &[u8] {
+    debug_assert!(r.0 <= r.1 && r.1 <= buf.len());
+    unsafe { buf.get_unchecked(r.0..r.1) }
+}
+
 /// Strip quotes from fields that are wrapped in them; false if the line breaks the quote rule.
 /// A quote may only open and close a whole field. Every field that starts with a quote must
 /// end with one; if the line holds any other quote, the count `nq` will not match.
@@ -1238,6 +1246,7 @@ struct ERaw {
     ingest: u32,
     ts: u32,
     pc: u32, // price | cat << 24; 0 for view/cart
+    h: u32,  // low 32 bits of ek.mix(): dedup slot index without rehashing (was padding)
 }
 
 /// Person key -> small dense number for one bucket (open addressing, grows when needed).
@@ -1891,11 +1900,12 @@ fn main() {
                         let (ts_opt, ingest_opt) = if exp == 3 {
                             (Some(std::hint::black_box(ws + 1000)), Some(std::hint::black_box(ws + 5000)))
                         } else {
-                            tsp.parse_pair(&buf[fb[2].0..fb[2].1], &buf[fb[3].0..fb[3].1])
+                            tsp.parse_pair(fld(buf, fb[2]), fld(buf, fb[3]))
                         };
                         let ingest_ms = ingest_opt.unwrap_or(i64::MAX / 4);
                         let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
-                        let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
+                        let hm = ek.mix();
+                        let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0, h: hm as u32 };
                         'v: {
                             if us == ue {
                                 break 'v;
@@ -1925,7 +1935,7 @@ fn main() {
                                 break 'v;
                             }
                             if purchase {
-                                let Some(price) = parse_price(&buf[fb[6].0..fb[6].1]) else { break 'v };
+                                let Some(price) = parse_price(fld(buf, fb[6])) else { break 'v };
                                 let cat = prod_tab.get(buf, ps, pe - ps).unwrap_or(unknown_cat);
                                 r.pc = price | (cat << 24);
                             }
@@ -1939,7 +1949,7 @@ fn main() {
                             std::hint::black_box(r);
                             return;
                         }
-                        wc.push(g, (ek.mix() >> (64 - EB)) as usize, r);
+                        wc.push(g, (hm >> (64 - EB)) as usize, r);
                     });
                 })));
             });
@@ -1973,10 +1983,10 @@ fn main() {
             for (i, r) in part.iter().enumerate() {
                 // Start loading the slot the record 8 ahead will probe.
                 if let Some(ahead) = part.get(i + 8) {
-                    prefetch(unsafe { slots.as_ptr().add((ahead.ek.mix() as usize) & mask) });
+                    prefetch(unsafe { slots.as_ptr().add((ahead.h as usize) & mask) });
                 }
                 let packed = ((t as u32) << 26) | i as u32;
-                let mut s = (r.ek.mix() as usize) & mask;
+                let mut s = (r.h as usize) & mask;
                 loop {
                     let sl = unsafe { slots.get_unchecked_mut(s) };
                     if sl.k.is_empty() {
@@ -2045,7 +2055,7 @@ fn main() {
                 if cs == ce || us == ue {
                     return;
                 }
-                let Some(ts) = tsp.parse(&buf[fb[3].0..fb[3].1]) else { return };
+                let Some(ts) = tsp.parse(fld(buf, fb[3])) else { return };
                 if ts < base || ts >= we {
                     return;
                 }
