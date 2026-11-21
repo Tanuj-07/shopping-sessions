@@ -1419,8 +1419,6 @@ impl PIdx {
 
 /// Per-core sessions scratch, reused for every bucket.
 struct SessScratch {
-    ev: Vec<PEv>,
-    ck: Vec<PCk>,
     ea: Vec<PEv>,
     eb: Vec<PEv>,
     ca: Vec<PCk>,
@@ -1432,7 +1430,7 @@ struct SessScratch {
 
 impl SessScratch {
     const fn new() -> Self {
-        SessScratch { ev: Vec::new(), ck: Vec::new(), ea: Vec::new(), eb: Vec::new(), ca: Vec::new(), cb: Vec::new(), est: Vec::new(), cst: Vec::new(), pidx: PIdx::new() }
+        SessScratch { ea: Vec::new(), eb: Vec::new(), ca: Vec::new(), cb: Vec::new(), est: Vec::new(), cst: Vec::new(), pidx: PIdx::new() }
     }
 }
 
@@ -2289,7 +2287,7 @@ fn main() {
             // scatter by person id. Person order does not matter for the output. While grouping,
             // each record's pk field holds its dense person id (the real key is pidx.keys[id]).
             let mut scr = scr.borrow_mut();
-            let SessScratch { ev, ck, ea, eb, ca, cb, est, cst, pidx, .. } = &mut *scr;
+            let SessScratch { ea, eb, ca, cb, est, cst, pidx, .. } = &mut *scr;
             let n_ev: usize = pev.iter().map(|t| t[b].len()).sum();
             pidx.reset(n_ev / 16 + 16);
             ea.clear();
@@ -2308,7 +2306,8 @@ fn main() {
             for i in 2..np + 2 {
                 est[i] += est[i - 1];
             }
-            let sorted_e: &[PEv] = if exp == 11 || radix31(ea, eb, |e| e.ts) { &ea[..] } else { &eb[..] };
+            // The person scatter goes into whichever buffer the sort left free (no third buffer).
+            let (sorted_e, ev) = if exp == 11 || radix31(ea, eb, |e| e.ts) { (&*ea, &mut *eb) } else { (&*eb, &mut *ea) };
             ev.clear();
             ev.reserve(n_ev);
             unsafe {
@@ -2320,6 +2319,7 @@ fn main() {
                 }
                 ev.set_len(n_ev);
             }
+            let ev: &[PEv] = &ev[..];
             // est[p]..est[p + 1] is person p's events, in time order. Clicks of persons with no
             // events are dropped: they can never credit or assist a session.
             ca.clear();
@@ -2339,7 +2339,7 @@ fn main() {
             for i in 2..np + 2 {
                 cst[i] += cst[i - 1];
             }
-            let sorted_c: &[PCk] = if exp == 11 || radix31(ca, cb, |c| c.ts) { &ca[..] } else { &cb[..] };
+            let (sorted_c, ck) = if exp == 11 || radix31(ca, cb, |c| c.ts) { (&*ca, &mut *cb) } else { (&*cb, &mut *ca) };
             ck.clear();
             ck.reserve(n_ck_kept);
             unsafe {
