@@ -279,7 +279,8 @@ thread_local! {
 
 static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10); // TEMP: tuning via SS_SLAB
 static USE512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static EXP_G: AtomicU32 = AtomicU32::new(0); // TEMP: profiling switch visible to the scanner
+static EXP_G: AtomicU32 = AtomicU32::new(0);
+static PF_G: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32); // TEMP: tuning via SS_PF // TEMP: profiling switch visible to the scanner
 
 /// Calls `f(fields)` with absolute field ranges for every well-formed line of buf[s..e].
 #[inline(always)]
@@ -540,7 +541,7 @@ thread_local! {
     /// Per-core read buffer, reused for every chunk.
     static RBUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// Per-core dedup table (keys, record index), reused for every bucket.
-    static DSCR: RefCell<(Vec<K>, Vec<u32>, Vec<(K, u32, u32)>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+    static DSCR: RefCell<(Vec<DSlot>, Vec<(K, u32, u32)>)> = const { RefCell::new((Vec::new(), Vec::new())) };
     /// Per-core click staging buffer, reused for every chunk.
     static CSCR: RefCell<Vec<PCk>> = const { RefCell::new(Vec::new()) };
     /// Per-core session sort buffers, reused for every bucket.
@@ -844,6 +845,92 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     }
 }
 
+// ---------------------------------------------------------------- small exact lookup table
+
+#[inline(always)]
+fn low_bytes(n: usize) -> u64 {
+    if n >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * n)) - 1
+    }
+}
+
+/// Exact 16-byte key of an ID of 1..=15 bytes: the bytes, zero-padded, with the length in the
+/// top byte. Reads 16 bytes from `off` (callers' buffers have 16 bytes of slack).
+#[inline(always)]
+fn key16(buf: &[u8], off: usize, len: usize) -> (u64, u64) {
+    let lo = load8(buf, off);
+    let hi = load8(buf, off + 8);
+    if len >= 8 {
+        (lo, (hi & low_bytes(len - 8)) | ((len as u64) << 56))
+    } else {
+        (lo & low_bytes(len), (len as u64) << 56)
+    }
+}
+
+/// Campaign ID -> index, exact. Short IDs use an open-addressing table that fits in cache;
+/// anything longer than 15 bytes falls back to a hash map.
+struct SmallTab {
+    tab: Vec<(u64, u64, u32)>,
+    mask: usize,
+    long: FxHashMap<Vec<u8>, u32>,
+}
+
+impl SmallTab {
+    fn new(items: &[(&[u8], u32)]) -> Self {
+        let cap = (items.len() * 2).next_power_of_two().max(16);
+        let mut t = SmallTab { tab: vec![(0, 0, 0); cap], mask: cap - 1, long: FxHashMap::default() };
+        for &(id, v) in items {
+            if id.is_empty() {
+                continue;
+            }
+            if id.len() > 15 {
+                t.long.entry(id.to_vec()).or_insert(v);
+                continue;
+            }
+            let mut pad = [0u8; 32];
+            pad[..id.len()].copy_from_slice(id);
+            let (lo, hi) = key16(&pad, 0, id.len());
+            let mut i = (mum(lo ^ 0x9E37_79B9_7F4A_7C15, hi ^ 0xD6E8_FEB8_6659_FD93) as usize) & t.mask;
+            loop {
+                let e = &mut t.tab[i];
+                if e.1 == 0 {
+                    *e = (lo, hi, v);
+                    break;
+                }
+                if e.0 == lo && e.1 == hi {
+                    break; // first occurrence wins, like the hash map it replaces
+                }
+                i = (i + 1) & t.mask;
+            }
+        }
+        t
+    }
+
+    #[inline(always)]
+    fn get(&self, buf: &[u8], off: usize, len: usize) -> Option<u32> {
+        if len == 0 {
+            return None;
+        }
+        if len > 15 {
+            return self.long.get(&buf[off..off + len]).copied();
+        }
+        let (lo, hi) = key16(buf, off, len);
+        let mut i = (mum(lo ^ 0x9E37_79B9_7F4A_7C15, hi ^ 0xD6E8_FEB8_6659_FD93) as usize) & self.mask;
+        loop {
+            let e = unsafe { self.tab.get_unchecked(i) };
+            if e.0 == lo && e.1 == hi {
+                return Some(e.2);
+            }
+            if e.1 == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- records
 
 /// Event copy before dedup. ts == u32::MAX marks an invalid copy.
@@ -854,6 +941,18 @@ struct ERaw {
     ingest: u32,
     ts: u32,
     pc: u32, // price | cat << 24; 0 for view/cart
+}
+
+/// Dedup table slot: event key, where the kept copy is, and its ingest time (one cache access).
+#[derive(Clone, Copy)]
+struct DSlot {
+    k: K,
+    idx: u32,
+    ingest: u32,
+}
+
+impl DSlot {
+    const EMPTY: DSlot = DSlot { k: K::EMPTY, idx: 0, ingest: 0 };
 }
 
 #[derive(Clone, Copy)]
@@ -1015,6 +1114,9 @@ fn main() {
     rayon::ThreadPoolBuilder::new().num_threads(nt).build_global().unwrap();
     #[cfg(target_arch = "x86_64")]
     USE512.store(is_x86_feature_detected!("avx512bw") && std::env::var_os("SS_NO512").is_none(), Relaxed);
+    if let Some(v) = std::env::var("SS_PF").ok().and_then(|s| s.parse::<usize>().ok()) {
+        PF_G.store(v, Relaxed);
+    }
     if let Some(v) = std::env::var("SS_SLAB").ok().and_then(|s| s.parse::<usize>().ok()) {
         SLAB_SZ.store(v << 10, Relaxed);
     }
@@ -1082,6 +1184,8 @@ fn main() {
     }
     let ncamp = camp_ids.len();
     let organic = ncamp as u32;
+    let camp_items: Vec<(&[u8], u32)> = camp_ids.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
+    let camp_tab = SmallTab::new(&camp_items);
     let reg = Reg(Mutex::new(FxHashMap::default()));
     let reg = &reg;
     lap("setup");
@@ -1273,35 +1377,33 @@ fn main() {
     let pev: PerThread<PEv> = PerThread::new(nt, npb, reserve);
     (0..neb).into_par_iter().for_each(|b| DSCR.with(|scr| {
         let mut scr = scr.borrow_mut();
-        let (keys, idx, kept) = &mut *scr;
+        let (slots, kept) = &mut *scr;
         kept.clear();
         let parts: Vec<&[ERaw]> = stage1.iter().map(|t| &t[b][..]).collect();
         let n: usize = parts.iter().map(|p| p.len()).sum();
-        let cap = (n * 2).next_power_of_two().max(16);
+        let cap = ((n * 3) / 2).next_power_of_two().max(16);
         let mask = cap - 1;
         // Reuse this core's table: clearing warm memory beats faulting in fresh pages.
-        if keys.len() < cap {
-            keys.resize(cap, K::EMPTY);
-            idx.resize(cap, 0);
+        if slots.len() < cap {
+            slots.resize(cap, DSlot::EMPTY);
         }
-        let keys = &mut keys[..cap];
-        let idx = &mut idx[..cap];
-        keys.fill(K::EMPTY);
+        let slots = &mut slots[..cap];
+        slots.fill(DSlot::EMPTY);
         let get = |x: u32| unsafe { parts.get_unchecked((x >> 26) as usize).get_unchecked((x & ((1 << 26) - 1)) as usize) };
         for (t, part) in parts.iter().enumerate() {
             for (i, r) in part.iter().enumerate() {
                 let packed = ((t as u32) << 26) | i as u32;
                 let mut s = (r.ek.mix() as usize) & mask;
                 loop {
-                    let k = unsafe { *keys.get_unchecked(s) };
-                    if k.is_empty() {
-                        keys[s] = r.ek;
-                        idx[s] = packed;
+                    let sl = unsafe { slots.get_unchecked_mut(s) };
+                    if sl.k.is_empty() {
+                        *sl = DSlot { k: r.ek, idx: packed, ingest: r.ingest };
                         break;
                     }
-                    if k == r.ek {
-                        if r.ingest < get(idx[s]).ingest {
-                            idx[s] = packed;
+                    if sl.k == r.ek {
+                        if r.ingest < sl.ingest {
+                            sl.idx = packed;
+                            sl.ingest = r.ingest;
                         }
                         break;
                     }
@@ -1310,11 +1412,11 @@ fn main() {
             }
         }
         pev.with(|g| {
-            for s in 0..cap {
-                if keys[s].is_empty() {
+            for sl in slots.iter() {
+                if sl.k.is_empty() {
                     continue;
                 }
-                let r = get(idx[s]);
+                let r = get(sl.idx);
                 if r.ts == u32::MAX {
                     continue;
                 }
@@ -1322,13 +1424,13 @@ fn main() {
             }
             // Person lookups jump around a table far bigger than the CPU cache. Ask for the
             // entry PF events ahead so the memory waits overlap instead of queueing up.
-            const PF: usize = 16;
-            for x in kept.iter().take(PF) {
+            let pf = PF_G.load(Relaxed);
+            for x in kept.iter().take(pf) {
                 pmap.prefetch(x.0);
             }
             for i in 0..kept.len() {
-                if i + PF < kept.len() {
-                    pmap.prefetch(kept[i + PF].0);
+                if i + pf < kept.len() {
+                    pmap.prefetch(kept[i + pf].0);
                 }
                 let (uk, ts, pc) = kept[i];
                 let pk = if exp == 7 { uk } else { pmap.get(uk) };
@@ -1363,19 +1465,19 @@ fn main() {
                 if ts < base || ts >= we {
                     return;
                 }
-                let Some(&camp) = camp_idx.get(&buf[fb[2].0..fb[2].1]) else { return };
+                let Some(camp) = camp_tab.get(buf, fb[2].0, fb[2].1 - fb[2].0) else { return };
                 let uk = key_of(buf, us, ue - us, Some(reg));
                 let ck = key_of(buf, cs, ce - cs, Some(reg));
                 local.push(PCk { pk: uk, ck, ts: (ts - base) as u32, camp });
             });
             // ...then map users to persons with the table entries prefetched ahead.
-            const PF: usize = 16;
-            for x in local.iter().take(PF) {
+            let pf = PF_G.load(Relaxed);
+            for x in local.iter().take(pf) {
                 pmap.prefetch(x.pk);
             }
             for i in 0..local.len() {
-                if i + PF < local.len() {
-                    pmap.prefetch(local[i + PF].pk);
+                if i + pf < local.len() {
+                    pmap.prefetch(local[i + pf].pk);
                 }
                 let mut r = local[i];
                 r.pk = pmap.get(r.pk);
