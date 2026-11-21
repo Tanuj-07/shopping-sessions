@@ -388,10 +388,38 @@ thread_local! {
         const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
 }
 
-static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10); // TEMP: tuning via SS_SLAB
+// Profiling/tuning knobs. Only a `--features profile` build reads them from the environment
+// (SS_EXP, SS_SLAB, SS_PF); in the normal build they are constants and every check on them
+// compiles away.
+static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10);
 static USE512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EXP_G: AtomicU32 = AtomicU32::new(0);
-static PF_G: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32); // TEMP: tuning via SS_PF // TEMP: profiling switch visible to the scanner
+static PF_G: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32);
+
+#[inline(always)]
+fn exp_g() -> u32 {
+    if cfg!(feature = "profile") {
+        EXP_G.load(Relaxed)
+    } else {
+        0
+    }
+}
+#[inline(always)]
+fn slab_size() -> usize {
+    if cfg!(feature = "profile") {
+        SLAB_SZ.load(Relaxed)
+    } else {
+        32 << 10
+    }
+}
+#[inline(always)]
+fn prefetch_distance() -> usize {
+    if cfg!(feature = "profile") {
+        PF_G.load(Relaxed)
+    } else {
+        32
+    }
+}
 
 /// Calls `f(fields)` with absolute field ranges for every well-formed line of buf[s..e].
 #[inline(always)]
@@ -406,7 +434,7 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
                 let mut p = s;
                 while p < e {
                     // A slab ends right after a newline (or at e), so no line crosses slabs.
-                    let lim = (p + SLAB_SZ.load(Relaxed)).min(e);
+                    let lim = (p + slab_size()).min(e);
                     let q = if lim == e {
                         e
                     } else {
@@ -425,7 +453,7 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
                             index_slab_avx2(buf, p, q, seps, nls, qs, qa, qb)
                         }
                     };
-                    if EXP_G.load(Relaxed) != 10 {
+                    if exp_g() != 10 {
                         walk_slab::<N>(p, seps, nls, qs, qa, qb, &mut f);
                     } else {
                         std::hint::black_box((seps.len(), nls.len()));
@@ -1310,7 +1338,7 @@ impl SessScratch {
     }
 }
 
-/// TEMP profiling: records a sessions task's duration when dropped.
+/// Profiling (SS_EXP=13): records a sessions task's duration when dropped.
 struct TaskTimer<'a>(bool, Instant, usize, &'a Mutex<Vec<(f64, usize)>>);
 impl Drop for TaskTimer<'_> {
     fn drop(&mut self) {
@@ -1586,10 +1614,13 @@ fn main() {
     rayon::ThreadPoolBuilder::new().num_threads(nt).build_global().unwrap();
     #[cfg(target_arch = "x86_64")]
     USE512.store(is_x86_feature_detected!("avx512bw") && std::env::var_os("SS_NO512").is_none(), Relaxed);
-    if let Some(v) = std::env::var("SS_PF").ok().and_then(|s| s.parse::<usize>().ok()) {
+    if !cfg!(feature = "profile") {
+        // knobs below are profiling-only
+    } else if let Some(v) = std::env::var("SS_PF").ok().and_then(|s| s.parse::<usize>().ok()) {
         PF_G.store(v, Relaxed);
     }
-    if let Some(v) = std::env::var("SS_SLAB").ok().and_then(|s| s.parse::<usize>().ok()) {
+    if !cfg!(feature = "profile") {
+    } else if let Some(v) = std::env::var("SS_SLAB").ok().and_then(|s| s.parse::<usize>().ok()) {
         SLAB_SZ.store(v << 10, Relaxed);
     }
 
@@ -1678,7 +1709,7 @@ fn main() {
     let neb = 1usize << EB;
     let npb = 1usize << PB;
     let reserve = (ev_bytes / 80 / neb / nt) * 5 / 4 + 16;
-    let exp: u32 = std::env::var("SS_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0); // TEMP profiling switch
+    let exp: u32 = if cfg!(feature = "profile") { std::env::var("SS_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 };
     EXP_G.store(exp, Relaxed);
     let ev_chunk_count = make_chunks(sizes, 0..ne).len();
     let ck_chunk_count = make_chunks(sizes, ne..ne + nc).len();
@@ -1955,7 +1986,7 @@ fn main() {
             }
             // Person lookups jump around a table far bigger than the CPU cache. Ask for the
             // entry PF events ahead so the memory waits overlap instead of queueing up.
-            let pf = PF_G.load(Relaxed);
+            let pf = prefetch_distance();
             for x in kept.iter().take(pf) {
                 pmap.prefetch(x.0);
             }
@@ -2001,7 +2032,7 @@ fn main() {
                 local.push(PCk { pk: uk, ck, ts: (ts - base) as u32, camp });
             });
             // ...then map users to persons with the table entries prefetched ahead.
-            let pf = PF_G.load(Relaxed);
+            let pf = prefetch_distance();
             for x in local.iter().take(pf) {
                 pmap.prefetch(x.pk);
             }
@@ -2021,7 +2052,7 @@ fn main() {
     // ------------------------------------------------------------ 5. sessions
     let camp_acc: Vec<Mutex<Vec<[i64; 4]>>> = (0..nt).map(|_| Mutex::new(vec![[0i64; 4]; (ncamp + 1) * ndays])).collect();
     let any_long = !reg.0.lock().unwrap().is_empty();
-    let task_times: Mutex<Vec<(f64, usize)>> = Mutex::new(Vec::new()); // TEMP profiling (SS_EXP=13)
+    let task_times: Mutex<Vec<(f64, usize)>> = Mutex::new(Vec::new()); // profiling (SS_EXP=13)
     // Biggest buckets first (whales, shared devices), one task each, so the long ones start
     // immediately and the small ones fill the gaps at the end.
     let mut order: Vec<usize> = (0..npb).collect();
@@ -2031,8 +2062,7 @@ fn main() {
         .par_iter()
         .with_max_len(1)
         .map(|&b| SSCR.with(|scr| {
-            let t_task = Instant::now();
-            let _tt = TaskTimer(exp == 13, t_task, b, &task_times);
+            let _tt = TaskTimer(exp == 13, if exp == 13 { Instant::now() } else { t0 }, b, &task_times);
             // Group this bucket's events and clicks by person (counting, no comparisons), then
             // sort only within each person. Person order does not matter for the output.
             let mut scr = scr.borrow_mut();
