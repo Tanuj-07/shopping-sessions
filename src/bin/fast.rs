@@ -1254,6 +1254,9 @@ impl SmallTab {
     fn new(items: &[(&[u8], u32)]) -> Self {
         let cap = (items.len() * 2).next_power_of_two().max(16);
         let mut t = SmallTab { tab: vec![(0, 0, 0); cap], mask: cap - 1, long: FxHashMap::default() };
+        // Keys and home slots first, then the inserts with each slot's cache line requested
+        // a few items ahead (the table is bigger than the cache).
+        let mut ks: Vec<(u64, u64, u32, usize)> = Vec::with_capacity(items.len());
         for &(id, v) in items {
             if id.is_empty() {
                 continue;
@@ -1265,7 +1268,13 @@ impl SmallTab {
             let mut pad = [0u8; 32];
             pad[..id.len()].copy_from_slice(id);
             let (lo, hi) = key16(&pad, 0, id.len());
-            let mut i = (mum(lo ^ 0x9E37_79B9_7F4A_7C15, hi ^ 0xD6E8_FEB8_6659_FD93) as usize) & t.mask;
+            ks.push((lo, hi, v, (mum(lo ^ 0x9E37_79B9_7F4A_7C15, hi ^ 0xD6E8_FEB8_6659_FD93) as usize) & t.mask));
+        }
+        for j in 0..ks.len() {
+            if let Some(a) = ks.get(j + 16) {
+                prefetch(unsafe { t.tab.as_ptr().add(a.3) });
+            }
+            let (lo, hi, v, mut i) = ks[j];
             loop {
                 let e = &mut t.tab[i];
                 if e.1 == 0 {
@@ -1763,12 +1772,10 @@ fn manifest_value(text: &str, key: &str) -> i64 {
     parse_ts(rest[a..b].as_bytes()).expect("manifest timestamp")
 }
 
-fn small_lines(buf: &[u8]) -> Vec<&[u8]> {
-    let mut v: Vec<&[u8]> = buf.split(|&c| c == b'\n').skip(1).collect();
-    if buf.last() == Some(&b'\n') {
-        v.pop();
-    }
-    v
+/// The lines after the header (no empty piece after a final newline).
+fn small_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let body = if buf.last() == Some(&b'\n') { &buf[..buf.len() - 1] } else { buf };
+    body.split(|&c| c == b'\n').skip(1)
 }
 
 fn main() {
