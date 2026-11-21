@@ -838,9 +838,6 @@ thread_local! {
     static DSCR: RefCell<(Vec<DSlot>, Vec<(K, u32, u32)>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
     /// Per-core click staging buffer, reused for every chunk.
     static CSCR: RefCell<Vec<PCk>> = const { RefCell::new(Vec::new()) };
-    /// Per-core write-combining slots for event parsing (measured: helps the 32-byte event
-    /// records, hurts the 16/24-byte ones, so only this writer uses it).
-    static WC_E: RefCell<Wc<ERaw, 4>> = const { RefCell::new(Wc::new()) };
     /// Per-core session sort buffers, reused for every bucket.
     static SSCR: RefCell<SessScratch> = const { RefCell::new(SessScratch::new()) };
 }
@@ -1506,101 +1503,130 @@ struct UdRow {
     top: u16,
 }
 
-/// Per-thread bucketed output buffers; each rayon thread only touches its own slot.
-struct PerThread<T> {
-    slots: Vec<Mutex<Vec<Vec<T>>>>,
+// ---------------------------------------------------------------- block storage
+//
+// Record buckets are chains of 8 KB blocks taken from per-thread pools. Blocks come from 16 MB
+// slabs (huge pages on Linux) and are recycled: when dedup has consumed an event bucket, its
+// blocks go back to that thread's pool and the person / click buckets written next reuse them,
+// so those writes land in memory that is already faulted in (and the process touches far less
+// fresh memory, which is also what the OS tears down at exit).
+
+const BLOCK: usize = 8 << 10;
+const SLAB: usize = 16 << 20;
+
+struct Pool {
+    free: Vec<*mut u8>,
+    cur: *mut u8,
+    left: usize,
 }
 
-impl<T: Send> PerThread<T> {
-    fn new(nt: usize, nb: usize, reserve: usize) -> Self {
-        PerThread {
-            slots: (0..nt).map(|_| Mutex::new((0..nb).map(|_| Vec::with_capacity(reserve)).collect())).collect(),
+thread_local! {
+    static POOL: RefCell<Pool> = const { RefCell::new(Pool { free: Vec::new(), cur: std::ptr::null_mut(), left: 0 }) };
+}
+
+#[inline]
+fn pool_take() -> *mut u8 {
+    POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(b) = p.free.pop() {
+            return b;
+        }
+        if p.left < BLOCK {
+            let layout = std::alloc::Layout::from_size_align(SLAB, 4096).unwrap();
+            let m = unsafe { std::alloc::alloc(layout) };
+            assert!(!m.is_null(), "out of memory");
+            p.cur = m;
+            p.left = SLAB;
+        }
+        let b = p.cur;
+        p.cur = unsafe { p.cur.add(BLOCK) };
+        p.left -= BLOCK;
+        b
+    })
+}
+
+/// Hand blocks back to this thread's pool. The caller must never read them again.
+fn pool_give(blocks: &[*mut u8]) {
+    POOL.with(|p| p.borrow_mut().free.extend_from_slice(blocks));
+}
+
+/// A growable sequence of `T` stored as a chain of pool blocks.
+struct Stream<T> {
+    blocks: Vec<*mut u8>,
+    last: usize, // items in the last block
+    _t: std::marker::PhantomData<T>,
+}
+
+unsafe impl<T: Send> Send for Stream<T> {}
+unsafe impl<T: Sync> Sync for Stream<T> {}
+
+impl<T: Copy> Stream<T> {
+    const PER: usize = BLOCK / std::mem::size_of::<T>();
+
+    fn new() -> Self {
+        Stream { blocks: Vec::new(), last: Self::PER, _t: std::marker::PhantomData }
+    }
+    #[inline(always)]
+    fn push(&mut self, v: T) {
+        if self.last == Self::PER {
+            self.blocks.push(pool_take());
+            self.last = 0;
+        }
+        unsafe {
+            let b = *self.blocks.last().unwrap_unchecked() as *mut T;
+            b.add(self.last).write(v);
+        }
+        self.last += 1;
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        if self.blocks.is_empty() {
+            0
+        } else {
+            (self.blocks.len() - 1) * Self::PER + self.last
         }
     }
-    fn with<R>(&self, f: impl FnOnce(&mut Vec<Vec<T>>) -> R) -> R {
+    /// Item `i` (i < len).
+    #[inline(always)]
+    fn get(&self, i: usize) -> &T {
+        unsafe { &*(*self.blocks.get_unchecked(i / Self::PER) as *const T).add(i % Self::PER) }
+    }
+    /// The items, one slice per block.
+    fn chunks(&self) -> impl Iterator<Item = &[T]> + '_ {
+        let n = self.blocks.len();
+        self.blocks.iter().enumerate().map(move |(k, &b)| unsafe {
+            std::slice::from_raw_parts(b as *const T, if k + 1 == n { self.last } else { Self::PER })
+        })
+    }
+    fn iter(&self) -> impl Iterator<Item = &T> + '_ {
+        self.chunks().flatten()
+    }
+}
+
+impl<'a, T: Copy> IntoIterator for &'a Stream<T> {
+    type Item = &'a T;
+    type IntoIter = Box<dyn Iterator<Item = &'a T> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+/// Per-thread bucketed output streams; each rayon thread only touches its own slot.
+struct PerThread<T> {
+    slots: Vec<Mutex<Vec<Stream<T>>>>,
+}
+
+impl<T: Send + Copy> PerThread<T> {
+    fn new(nt: usize, nb: usize, _reserve: usize) -> Self {
+        PerThread { slots: (0..nt).map(|_| Mutex::new((0..nb).map(|_| Stream::new()).collect())).collect() }
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<Stream<T>>) -> R) -> R {
         let t = rayon::current_thread_index().unwrap_or(0);
         let mut g = self.slots[t].lock().unwrap();
         f(&mut g)
     }
-    fn into_inner(self) -> Vec<Vec<Vec<T>>> {
+    fn into_inner(self) -> Vec<Vec<Stream<T>>> {
         self.slots.into_iter().map(|m| m.into_inner().unwrap()).collect()
-    }
-}
-
-/// Write-combining: each core gathers W records per bucket in a small staging slot and streams
-/// a full slot straight to memory with non-temporal stores (no read-for-ownership of the
-/// destination, no cache pollution: the buckets are far larger than the cache and are only
-/// read in the next stage). Record order inside a bucket changes; no later stage cares.
-struct Wc<T: Copy + Default, const W: usize> {
-    stage: Vec<[T; W]>,
-    cnt: Vec<u8>,
-}
-
-impl<T: Copy + Default, const W: usize> Wc<T, W> {
-    const WORDS_OK: () = assert!(std::mem::size_of::<T>() % 8 == 0 && std::mem::align_of::<T>() >= 8);
-    const fn new() -> Self {
-        Wc { stage: Vec::new(), cnt: Vec::new() }
-    }
-    fn ensure(&mut self, nb: usize) {
-        let () = Self::WORDS_OK;
-        if self.cnt.len() < nb {
-            self.stage.resize(nb, [T::default(); W]);
-            self.cnt.resize(nb, 0);
-        }
-    }
-    #[inline(always)]
-    fn push(&mut self, out: &mut [Vec<T>], b: usize, v: T) {
-        unsafe {
-            let c = *self.cnt.get_unchecked(b) as usize;
-            let st = self.stage.get_unchecked_mut(b);
-            *st.get_unchecked_mut(c) = v;
-            if c + 1 == W {
-                let v = out.get_unchecked_mut(b);
-                v.reserve(W);
-                let dst = v.as_mut_ptr().add(v.len()) as *mut i64;
-                let src = st.as_ptr() as *const i64;
-                let words = W * std::mem::size_of::<T>() / 8;
-                #[cfg(target_arch = "x86_64")]
-                for k in 0..words {
-                    std::arch::x86_64::_mm_stream_si64(dst.add(k), *src.add(k));
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                std::ptr::copy_nonoverlapping(src, dst, words);
-                v.set_len(v.len() + W);
-                *self.cnt.get_unchecked_mut(b) = 0;
-            } else {
-                *self.cnt.get_unchecked_mut(b) = (c + 1) as u8;
-            }
-        }
-    }
-    fn flush(&mut self, out: &mut [Vec<T>]) {
-        for b in 0..self.cnt.len() {
-            let c = self.cnt[b] as usize;
-            if c > 0 {
-                out[b].extend_from_slice(&self.stage[b][..c]);
-                self.cnt[b] = 0;
-            }
-        }
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_sfence()
-        };
-    }
-}
-
-impl<T: Send + Copy + Default> PerThread<T> {
-    /// After a stage: every pool thread empties its staging slots into its own buckets.
-    fn flush_wc<const W: usize>(&self, wc: &'static std::thread::LocalKey<RefCell<Wc<T, W>>>) {
-        rayon::broadcast(|ctx| {
-            let mut g = self.slots[ctx.index()].lock().unwrap();
-            wc.with(|w| w.borrow_mut().flush(&mut g));
-        });
-        // A stage with a single piece of work runs on the calling (non-pool) thread, which
-        // used slot 0 (see `with`): empty its staging slots too.
-        if rayon::current_thread_index().is_none() {
-            let mut g = self.slots[0].lock().unwrap();
-            wc.with(|w| w.borrow_mut().flush(&mut g));
-        }
     }
 }
 
@@ -1955,13 +1981,11 @@ fn main() {
             let ev_chunks = make_chunks(sizes, 0..ne);
             let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
             ev_chunks.par_iter().for_each(|c| {
-                stage1.with(|g| WC_E.with(|wcc| with_chunk(c, &mut |buf, cs, ce| {
+                stage1.with(|g| with_chunk(c, &mut |buf, cs, ce| {
                     if exp == 4 {
                         std::hint::black_box(buf.len());
                         return;
                     }
-                    let mut wc = wcc.borrow_mut();
-                    wc.ensure(neb);
                     let mut tsp = TsParser::new();
                     scan_fields::<7>(buf, cs, ce, |fb| {
                         if exp == 2 {
@@ -2037,11 +2061,10 @@ fn main() {
                             std::hint::black_box(r);
                             return;
                         }
-                        wc.push(g, (hm >> (64 - EB)) as usize, r);
+                        unsafe { g.get_unchecked_mut((hm >> (64 - EB)) as usize) }.push(r);
                     });
-                })));
+                }));
             });
-            stage1.flush_wc(&WC_E);
             stage1.into_inner()
         },
     );
@@ -2055,7 +2078,7 @@ fn main() {
         let (slots, kept, used) = &mut *scr;
         kept.clear();
         used.clear();
-        let parts: Vec<&[ERaw]> = stage1.iter().map(|t| &t[b][..]).collect();
+        let parts: Vec<&Stream<ERaw>> = stage1.iter().map(|t| &t[b]).collect();
         let n: usize = parts.iter().map(|p| p.len()).sum();
         let cap = ((n * 3) / 2).next_power_of_two().max(16);
         let mask = cap - 1;
@@ -2066,11 +2089,14 @@ fn main() {
         // The table is always left all-empty by the previous bucket (the read pass below
         // resets every slot it reads), so there is no separate clearing pass.
         let slots = &mut slots[..cap];
-        let get = |x: u32| unsafe { parts.get_unchecked((x >> 26) as usize).get_unchecked((x & ((1 << 26) - 1)) as usize) };
+        let get = |x: u32| unsafe { parts.get_unchecked((x >> 26) as usize).get((x & ((1 << 26) - 1)) as usize) };
         for (t, part) in parts.iter().enumerate() {
-            for (i, r) in part.iter().enumerate() {
+            let mut base_i = 0usize;
+            for chunk in part.chunks() {
+            for (j, r) in chunk.iter().enumerate() {
+                let i = base_i + j;
                 // Start loading the slot the record 8 ahead will probe.
-                if let Some(ahead) = part.get(i + 8) {
+                if let Some(ahead) = chunk.get(j + 8) {
                     prefetch(unsafe { slots.as_ptr().add((ahead.h as usize) & mask) });
                 }
                 let packed = ((t as u32) << 26) | i as u32;
@@ -2092,6 +2118,8 @@ fn main() {
                     s = (s + 1) & mask;
                 }
             }
+            base_i += chunk.len();
+            }
         }
         pev.with(|g| {
             // Visit only the slots that were filled (no scan over empty ones).
@@ -2104,6 +2132,11 @@ fn main() {
                     continue;
                 }
                 kept.push((r.uk, r.ts, r.pc));
+            }
+            // This event bucket is fully consumed: recycle its blocks for the person records
+            // written next (they are already in memory, so no fresh page faults).
+            for part in parts.iter() {
+                pool_give(&part.blocks);
             }
             // Person lookups jump around a table far bigger than the CPU cache. Ask for the
             // entry PF events ahead so the memory waits overlap instead of queueing up.
