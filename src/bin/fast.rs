@@ -28,6 +28,73 @@ use shopping_sessions::pq::{self, Col};
 /// Linux: back every big allocation (>= 4 MB: the record buckets, tables, sort space) with
 /// 2 MB transparent huge pages. That is 512x fewer pages to fault in while running and to tear
 /// down at exit. madvise is only a hint: if THP is off on the host, nothing changes.
+/// Profiling build on Windows: a sampling profiler. With SS_SAMPLE=<file>, a background
+/// thread suspends each pool thread ~1000 times a second, records its instruction pointer
+/// (relative to the module base), and writes the samples to <file> at exit. The separate
+/// `tools/symbolize` program turns them into hot source lines.
+#[cfg(all(windows, feature = "profile"))]
+mod sampler {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    type Handle = isize;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> Handle;
+        fn GetCurrentProcess() -> Handle;
+        fn DuplicateHandle(sp: Handle, sh: Handle, tp: Handle, th: *mut Handle, access: u32, inherit: i32, opts: u32) -> i32;
+        fn SuspendThread(h: Handle) -> u32;
+        fn ResumeThread(h: Handle) -> u32;
+        fn GetThreadContext(h: Handle, ctx: *mut u8) -> i32;
+        fn GetModuleHandleW(name: *const u16) -> isize;
+        fn Sleep(ms: u32);
+    }
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(p: u32) -> u32;
+    }
+    pub static THREADS: Mutex<Vec<Handle>> = Mutex::new(Vec::new());
+    /// Index of the stage currently running (bumped by `lap`), recorded with every sample.
+    pub static STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static STOP: AtomicBool = AtomicBool::new(false);
+    pub fn register() {
+        unsafe {
+            let mut h: Handle = 0;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut h, 0, 0, 2);
+            THREADS.lock().unwrap().push(h);
+        }
+    }
+    #[repr(C, align(16))]
+    struct Ctx([u8; 1232]);
+    pub fn start(path: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || unsafe {
+            timeBeginPeriod(1);
+            let base = GetModuleHandleW(std::ptr::null()) as u64;
+            let mut out: Vec<u64> = Vec::with_capacity(1 << 20);
+            let mut ctx = Box::new(Ctx([0; 1232]));
+            while !STOP.load(Ordering::Relaxed) {
+                let hs = THREADS.lock().unwrap().clone();
+                for h in hs {
+                    if SuspendThread(h) == u32::MAX {
+                        continue;
+                    }
+                    let flags: u32 = 0x0010_0001; // CONTEXT_AMD64 | CONTEXT_CONTROL
+                    ctx.0[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+                    if GetThreadContext(h, ctx.0.as_mut_ptr()) != 0 {
+                        let rip = u64::from_le_bytes(ctx.0[0xF8..0x100].try_into().unwrap());
+                        let off = rip.wrapping_sub(base);
+                        let off = if off < (1 << 40) { off } else { (1 << 40) - 1 }; // outside our module
+                        out.push((STAGE.load(Ordering::Relaxed) << 48) | off);
+                    }
+                    ResumeThread(h);
+                }
+                Sleep(1);
+            }
+            let txt: String = out.iter().map(|x| format!("{x:x}\n")).collect();
+            std::fs::write(path, txt).unwrap();
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod hugealloc {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -80,6 +147,7 @@ const EB: u32 = 10; // event dedup bucket bits
 const PB: u32 = 10; // person bucket bits
 const LB: u32 = 8; // link id table bits
 const CHUNK: usize = 4 << 20;
+const CK_CHUNK: usize = 1 << 20;
 
 // ---------------------------------------------------------------- hashing
 
@@ -742,12 +810,16 @@ struct Chunk {
 }
 
 fn make_chunks(sizes: &[usize], files: std::ops::Range<usize>) -> Vec<Chunk> {
+    make_chunks_sized(sizes, files, CHUNK)
+}
+
+fn make_chunks_sized(sizes: &[usize], files: std::ops::Range<usize>, chunk: usize) -> Vec<Chunk> {
     let mut out = Vec::new();
     for f in files {
         let n = sizes[f];
         let mut s = 0;
         while s < n {
-            let e = (s + CHUNK).min(n);
+            let e = (s + chunk).min(n);
             out.push(Chunk { file: f, start: s, end: e });
             s = e;
         }
@@ -1631,6 +1703,8 @@ fn main() {
     let t0 = Instant::now();
     let mut last = t0;
     let mut lap = |name: &str| {
+        #[cfg(all(windows, feature = "profile"))]
+        sampler::STAGE.fetch_add(1, Relaxed);
         let now = Instant::now();
         eprintln!("{:>10.3}s  {:>8.3}s  {}", (now - t0).as_secs_f64(), (now - last).as_secs_f64(), name);
         last = now;
@@ -1643,6 +1717,18 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .clamp(1, 31);
+    #[cfg(all(windows, feature = "profile"))]
+    let sample_path = std::env::var("SS_SAMPLE").ok();
+    #[cfg(all(windows, feature = "profile"))]
+    let sampler_thread = {
+        let mut b = rayon::ThreadPoolBuilder::new().num_threads(nt);
+        if sample_path.is_some() {
+            b = b.start_handler(|_| sampler::register());
+        }
+        b.build_global().unwrap();
+        sample_path.clone().map(sampler::start)
+    };
+    #[cfg(not(all(windows, feature = "profile")))]
     rayon::ThreadPoolBuilder::new().num_threads(nt).build_global().unwrap();
     #[cfg(target_arch = "x86_64")]
     USE512.store(is_x86_feature_detected!("avx512bw") && std::env::var_os("SS_NO512").is_none(), Relaxed);
@@ -1744,7 +1830,7 @@ fn main() {
     let exp: u32 = if cfg!(feature = "profile") { std::env::var("SS_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 };
     EXP_G.store(exp, Relaxed);
     let ev_chunk_count = make_chunks(sizes, 0..ne).len();
-    let ck_chunk_count = make_chunks(sizes, ne..ne + nc).len();
+    let ck_chunk_count = make_chunks_sized(sizes, ne..ne + nc, CK_CHUNK).len();
 
     // Linked IDs do not depend on event parsing, so they run at the same time: the person
     // map is ready long before the parse finishes.
@@ -1903,7 +1989,9 @@ fn main() {
                             tsp.parse_pair(fld(buf, fb[2]), fld(buf, fb[3]))
                         };
                         let ingest_ms = ingest_opt.unwrap_or(i64::MAX / 4);
-                        let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
+                        // ingest_ts is whole seconds (F1), so ms / 1000 is exact; unsigned math
+                        // is cheaper than div_euclid (values here are far above zero).
+                        let ingest = ((ingest_ms as u64 / 1000) as i64 - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                         let hm = ek.mix();
                         let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0, h: hm as u32 };
                         'v: {
@@ -2041,7 +2129,9 @@ fn main() {
     let pev = pev.into_inner();
     lap("dedup");
     // ------------------------------------------------------------ 4. clicks
-    let ck_chunks = make_chunks(sizes, ne..ne + nc);
+    // Smaller chunks for clicks: there is ~4x less click data, and 4 MB chunks left threads idle
+    // at the end of the stage.
+    let ck_chunks = make_chunks_sized(sizes, ne..ne + nc, CK_CHUNK);
     let pck: PerThread<PCk> = PerThread::new(nt, npb, (ck_bytes / 45 / npb / nt) * 5 / 4 + 16);
     ck_chunks.par_iter().for_each(|c| {
         pck.with(|g| CSCR.with(|cs_| with_chunk(c, &mut |buf, s0, e0| {
@@ -2430,6 +2520,11 @@ fn main() {
     lap("write");
     // Output files are fully written and closed above. Exit now instead of unmapping
     // the inputs and freeing every buffer; the OS reclaims all of it instantly.
+    #[cfg(all(windows, feature = "profile"))]
+    if let Some(h) = sampler_thread {
+        sampler::STOP.store(true, Relaxed);
+        h.join().unwrap();
+    }
     std::process::exit(0);
 }
 
