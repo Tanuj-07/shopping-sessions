@@ -278,6 +278,8 @@ thread_local! {
 }
 
 static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10); // TEMP: tuning via SS_SLAB
+static USE512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static EXP_G: AtomicU32 = AtomicU32::new(0); // TEMP: profiling switch visible to the scanner
 
 /// Calls `f(fields)` with absolute field ranges for every well-formed line of buf[s..e].
 #[inline(always)]
@@ -285,6 +287,7 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            let use512 = USE512.load(Relaxed);
             SIDX.with(|ix| {
                 let mut ix = ix.borrow_mut();
                 let (seps, nls, qs) = &mut *ix;
@@ -303,7 +306,13 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
                             },
                         }
                     };
-                    unsafe { index_slab_avx2(buf, p, q, seps, nls, qs) };
+                    unsafe {
+                        if use512 {
+                            index_slab_avx512(buf, p, q, seps, nls, qs)
+                        } else {
+                            index_slab_avx2(buf, p, q, seps, nls, qs)
+                        }
+                    };
                     walk_slab::<N>(buf, p, seps, nls, qs, &mut f);
                     p = q;
                 }
@@ -329,92 +338,117 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
     scan_scalar::<N>(buf, s, e, &mut line);
 }
 
+/// Comma, newline and quote bitmasks for the 64 bytes at `ptr` (bit i = byte i).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn masks_avx2(ptr: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(ptr as *const __m256i);
+    let b = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
+    let mask = |c: u8| -> u64 {
+        let v = _mm256_set1_epi8(c as i8);
+        let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64;
+        let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64;
+        lo | (hi << 32)
+    };
+    (mask(b'\n'), mask(b','), mask(b'"'))
+}
+
+/// Same masks with one 64-byte AVX-512 register per compare (the scorer's Xeons have AVX-512).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn masks_avx512(ptr: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm512_loadu_si512(ptr as *const _);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+
 /// Pass 1: record every separator (comma or newline) position, and every newline position
 /// with the number of quotes before it, for buf[p..q]. Positions are relative to p.
 /// No per-character branching: set bits are written out unconditionally, four at a time.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn index_slab_avx2(buf: &[u8], p: usize, q: usize, seps: &mut Vec<u32>, nls: &mut Vec<u32>, qs: &mut Vec<u32>) {
-    use std::arch::x86_64::*;
-    let len = q - p;
-    seps.clear();
-    nls.clear();
-    qs.clear();
-    seps.reserve(len + 72);
-    nls.reserve(len + 8);
-    qs.reserve(len + 8);
-    let sp = seps.as_mut_ptr();
-    let np = nls.as_mut_ptr();
-    let qp = qs.as_mut_ptr();
-    let (mut ns, mut nn) = (0usize, 0usize);
-    let mut qtot: u32 = 0;
-    let vnl = _mm256_set1_epi8(b'\n' as i8);
-    let vcm = _mm256_set1_epi8(b',' as i8);
-    let vqt = _mm256_set1_epi8(b'"' as i8);
-    let mut tail = [0u8; 64];
-    let mut off = 0usize;
-    while off < len {
-        let ptr = if off + 64 <= len {
-            buf.as_ptr().add(p + off)
-        } else {
-            let n = len - off;
-            tail[..n].copy_from_slice(&buf[p + off..q]);
-            tail[n..].fill(0);
-            tail.as_ptr()
-        };
-        let a = _mm256_loadu_si256(ptr as *const __m256i);
-        let b = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
-        let mask = |v: __m256i| -> u64 {
-            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64;
-            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64;
-            lo | (hi << 32)
-        };
-        let m_nl = mask(vnl);
-        let m_c = mask(vcm);
-        let m_q = mask(vqt);
-        let base = off as u32;
+/// One body, two instruction sets: only the mask function differs.
+macro_rules! define_index_slab {
+    ($name:ident, $features:literal, $masks:ident) => {
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = $features)]
+        unsafe fn $name(buf: &[u8], p: usize, q: usize, seps: &mut Vec<u32>, nls: &mut Vec<u32>, qs: &mut Vec<u32>) {
+            let len = q - p;
+            seps.clear();
+            nls.clear();
+            qs.clear();
+            seps.reserve(len + 72);
+            nls.reserve(len + 8);
+            qs.reserve(len + 8);
+            let sp = seps.as_mut_ptr();
+            let np = nls.as_mut_ptr();
+            let qp = qs.as_mut_ptr();
+            let (mut ns, mut nn) = (0usize, 0usize);
+            let mut qtot: u32 = 0;
+            let mut tail = [0u8; 64];
+            let mut off = 0usize;
+            while off < len {
+                let ptr = if off + 64 <= len {
+                    buf.as_ptr().add(p + off)
+                } else {
+                    let n = len - off;
+                    tail[..n].copy_from_slice(&buf[p + off..q]);
+                    tail[n..].fill(0);
+                    tail.as_ptr()
+                };
+                let (m_nl, m_c, m_q) = $masks(ptr);
+                let base = off as u32;
 
-        let sep = m_c | m_nl;
-        let cnt = sep.count_ones() as usize;
-        let out = sp.add(ns);
-        let mut bits = sep;
-        let mut i = 0;
-        while i < cnt {
-            *out.add(i) = base + bits.trailing_zeros();
-            bits &= bits.wrapping_sub(1);
-            *out.add(i + 1) = base + bits.trailing_zeros();
-            bits &= bits.wrapping_sub(1);
-            *out.add(i + 2) = base + bits.trailing_zeros();
-            bits &= bits.wrapping_sub(1);
-            *out.add(i + 3) = base + bits.trailing_zeros();
-            bits &= bits.wrapping_sub(1);
-            i += 4;
-        }
-        ns += cnt;
+                let sep = m_c | m_nl;
+                let cnt = sep.count_ones() as usize;
+                let out = sp.add(ns);
+                let mut bits = sep;
+                let mut i = 0;
+                while i < cnt {
+                    *out.add(i) = base + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *out.add(i + 1) = base + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *out.add(i + 2) = base + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *out.add(i + 3) = base + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    i += 4;
+                }
+                ns += cnt;
 
-        let mut bits = m_nl;
-        while bits != 0 {
-            let t = bits.trailing_zeros();
-            *np.add(nn) = base + t;
-            *qp.add(nn) = qtot + (m_q & ((1u64 << t) - 1)).count_ones();
-            nn += 1;
-            bits &= bits - 1;
+                let mut bits = m_nl;
+                while bits != 0 {
+                    let t = bits.trailing_zeros();
+                    *np.add(nn) = base + t;
+                    *qp.add(nn) = qtot + (m_q & ((1u64 << t) - 1)).count_ones();
+                    nn += 1;
+                    bits &= bits - 1;
+                }
+                qtot += m_q.count_ones();
+                off += 64;
+            }
+            // The file's last line may have no newline: end it with a virtual one.
+            if len > 0 && buf[q - 1] != b'\n' {
+                *sp.add(ns) = len as u32;
+                ns += 1;
+                *np.add(nn) = len as u32;
+                *qp.add(nn) = qtot;
+                nn += 1;
+            }
+            seps.set_len(ns);
+            nls.set_len(nn);
+            qs.set_len(nn);
         }
-        qtot += m_q.count_ones();
-        off += 64;
-    }
-    // The file's last line may have no newline: end it with a virtual one.
-    if len > 0 && buf[q - 1] != b'\n' {
-        *sp.add(ns) = len as u32;
-        ns += 1;
-        *np.add(nn) = len as u32;
-        *qp.add(nn) = qtot;
-        nn += 1;
-    }
-    seps.set_len(ns);
-    nls.set_len(nn);
-    qs.set_len(nn);
+    };
 }
+define_index_slab!(index_slab_avx2, "avx2", masks_avx2);
+define_index_slab!(index_slab_avx512, "avx2,avx512f,avx512bw", masks_avx512);
 
 /// Pass 2: walk the lines. A line is well-formed exactly when its N-th separator is its newline.
 #[inline(always)]
@@ -434,7 +468,7 @@ fn walk_slab<const N: usize>(buf: &[u8], p: usize, seps: &[u32], nls: &[u32], qs
                 fb[i] = (p + sv[i - 1] as usize + 1, p + sv[i] as usize);
             }
             k += N;
-            if nq == 0 || fix_quotes(buf, &mut fb, nq) {
+            if nq == 0 || EXP_G.load(Relaxed) == 6 || fix_quotes(buf, &mut fb, nq) {
                 f(&fb);
             }
         } else {
@@ -959,6 +993,8 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .clamp(1, 31);
     rayon::ThreadPoolBuilder::new().num_threads(nt).build_global().unwrap();
+    #[cfg(target_arch = "x86_64")]
+    USE512.store(is_x86_feature_detected!("avx512bw") && std::env::var_os("SS_NO512").is_none(), Relaxed);
     if let Some(v) = std::env::var("SS_SLAB").ok().and_then(|s| s.parse::<usize>().ok()) {
         SLAB_SZ.store(v << 10, Relaxed);
     }
@@ -1151,6 +1187,7 @@ fn main() {
     let reserve = (ev_bytes / 80 / neb / nt) * 5 / 4 + 16;
     let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
     let exp: u32 = std::env::var("SS_EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0); // TEMP profiling switch
+    EXP_G.store(exp, Relaxed);
     ev_chunks.par_iter().for_each(|c| {
         stage1.with(|g| with_chunk(c, &mut |buf, cs, ce| {
             if exp == 4 {
@@ -1167,7 +1204,7 @@ fn main() {
                 if es == ee {
                     return;
                 }
-                let ek = key_of(buf, es, ee - es, None);
+                let ek = if exp == 5 { K(std::hint::black_box(es as u64 * 0x9E37_79B9 | 1)) } else { key_of(buf, es, ee - es, None) };
                 let ingest_ms = if exp == 3 { std::hint::black_box(ws + 5000) } else { tsp.parse(&buf[fb[3].0..fb[3].1]).unwrap_or(i64::MAX / 4) };
                 let ingest = (ingest_ms.div_euclid(1000) - base_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                 let mut r = ERaw { ek, uk: K::EMPTY, ingest, ts: u32::MAX, pc: 0 };
@@ -1197,7 +1234,7 @@ fn main() {
                         let cat = prod_cat.get(&buf[ps..pe]).copied().unwrap_or(unknown_cat);
                         r.pc = price | (cat << 24);
                     }
-                    r.uk = key_of(buf, us, ue - us, Some(reg));
+                    r.uk = if exp == 5 { K(std::hint::black_box(us as u64 | 1)) } else { key_of(buf, us, ue - us, Some(reg)) };
                     r.ts = (ts - base) as u32;
                 }
                 if exp == 1 {
