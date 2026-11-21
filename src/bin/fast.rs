@@ -78,6 +78,7 @@ const GAP_MS: u32 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const EB: u32 = 10; // event dedup bucket bits
 const PB: u32 = 10; // person bucket bits
+const RADIX_MIN: usize = 2048; // per-person event groups this big are radix-sorted
 const LB: u32 = 8; // link id table bits
 const CHUNK: usize = 4 << 20;
 
@@ -1325,6 +1326,7 @@ impl PIdx {
 struct SessScratch {
     ev: Vec<PEv>,
     ck: Vec<PCk>,
+    rtmp: Vec<PEv>,
     gi: Vec<u32>,
     cgi: Vec<u32>,
     est: Vec<u32>,
@@ -1334,7 +1336,7 @@ struct SessScratch {
 
 impl SessScratch {
     const fn new() -> Self {
-        SessScratch { ev: Vec::new(), ck: Vec::new(), gi: Vec::new(), cgi: Vec::new(), est: Vec::new(), cst: Vec::new(), pidx: PIdx::new() }
+        SessScratch { ev: Vec::new(), ck: Vec::new(), rtmp: Vec::new(), gi: Vec::new(), cgi: Vec::new(), est: Vec::new(), cst: Vec::new(), pidx: PIdx::new() }
     }
 }
 
@@ -1345,6 +1347,51 @@ impl Drop for TaskTimer<'_> {
         if self.0 {
             self.3.lock().unwrap().push((self.1.elapsed().as_secs_f64(), self.2));
         }
+    }
+}
+
+/// LSD radix sort of events by ts (4 passes of 8 bits; a pass is skipped when every element
+/// has the same byte there). For the giant per-person groups (whales).
+fn radix_sort_ts(v: &mut [PEv], tmp: &mut Vec<PEv>) {
+    let n = v.len();
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut counts = [[0u32; 256]; 4];
+    for e in v.iter() {
+        for (k, c) in counts.iter_mut().enumerate() {
+            c[((e.ts >> (8 * k)) & 0xFF) as usize] += 1;
+        }
+    }
+    let mut in_v = true; // where the current data lives
+    for (k, c) in counts.iter().enumerate() {
+        if c.iter().any(|&x| x as usize == n) {
+            continue; // all elements share this byte: the pass would not move anything
+        }
+        let mut off = [0u32; 256];
+        let mut acc = 0u32;
+        for d in 0..256 {
+            off[d] = acc;
+            acc += c[d];
+        }
+        let shift = 8 * k;
+        if in_v {
+            for e in v.iter() {
+                let d = ((e.ts >> shift) & 0xFF) as usize;
+                unsafe { *tmp.get_unchecked_mut(off[d] as usize) = *e };
+                off[d] += 1;
+            }
+        } else {
+            for e in tmp.iter() {
+                let d = ((e.ts >> shift) & 0xFF) as usize;
+                unsafe { *v.get_unchecked_mut(off[d] as usize) = *e };
+                off[d] += 1;
+            }
+        }
+        in_v = !in_v;
+    }
+    if !in_v {
+        v.copy_from_slice(tmp);
     }
 }
 
@@ -2066,7 +2113,7 @@ fn main() {
             // Group this bucket's events and clicks by person (counting, no comparisons), then
             // sort only within each person. Person order does not matter for the output.
             let mut scr = scr.borrow_mut();
-            let SessScratch { ev, ck, gi, cgi, est, cst, pidx } = &mut *scr;
+            let SessScratch { ev, ck, rtmp, gi, cgi, est, cst, pidx } = &mut *scr;
             let n_ev: usize = pev.iter().map(|t| t[b].len()).sum();
             let n_ck: usize = pck.iter().map(|t| t[b].len()).sum();
             pidx.reset(n_ev / 16 + 16);
@@ -2146,7 +2193,13 @@ fn main() {
                     // No nested parallel sort here: while waiting on it, this thread could be
                     // handed another bucket's task that needs the same scratch (a panic).
                     // Biggest-first scheduling already starts the whale buckets immediately.
-                    sort_small_by(evs, |a, c| a.ts < c.ts, |v| v.sort_unstable_by_key(|e| e.ts));
+                    sort_small_by(evs, |a, c| a.ts < c.ts, |v| {
+                        if v.len() >= RADIX_MIN {
+                            radix_sort_ts(v, rtmp)
+                        } else {
+                            v.sort_unstable_by_key(|e| e.ts)
+                        }
+                    });
                 }
                 let cks = &mut ck[cst[p] as usize..cst[p + 1] as usize];
                 if any_long {
