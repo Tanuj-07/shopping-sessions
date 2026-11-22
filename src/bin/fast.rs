@@ -97,7 +97,8 @@ mod sampler {
 
 #[cfg(target_os = "linux")]
 mod hugealloc {
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{GlobalAlloc, Layout};
+    static MI: mimalloc::MiMalloc = mimalloc::MiMalloc;
     pub struct Huge;
     const BIG: usize = 4 << 20;
     const HP: usize = 2 << 20;
@@ -128,24 +129,24 @@ mod hugealloc {
     }
     unsafe impl GlobalAlloc for Huge {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = System.alloc(l);
+            let p = MI.alloc(l);
             if !p.is_null() && l.size() >= BIG {
                 advise(p, l.size());
             }
             p
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = System.alloc_zeroed(l);
+            let p = MI.alloc_zeroed(l);
             if !p.is_null() && l.size() >= BIG {
                 advise(p, l.size());
             }
             p
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            System.dealloc(p, l)
+            MI.dealloc(p, l)
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-            let q = System.realloc(p, l, new_size);
+            let q = MI.realloc(p, l, new_size);
             if !q.is_null() && new_size >= BIG {
                 advise(q, new_size);
             }
@@ -2224,8 +2225,32 @@ fn main() {
         b.build_global().unwrap();
         sample_path.clone().map(sampler::start)
     };
-    #[cfg(not(all(windows, feature = "profile")))]
+    #[cfg(not(any(all(windows, feature = "profile"), target_os = "linux")))]
     rayon::ThreadPoolBuilder::new().num_threads(nt).build_global().unwrap();
+    // Linux: pin worker i to the i-th CPU this process may use (the scorer gives exactly 8), so
+    // no worker gets moved between CPUs and loses its cache. SS_NO_PIN=1 turns it off.
+    #[cfg(target_os = "linux")]
+    {
+        let cpus: Vec<usize> = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+                (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        let pin = std::env::var_os("SS_NO_PIN").is_none() && cpus.len() >= nt;
+        let mut b = rayon::ThreadPoolBuilder::new().num_threads(nt);
+        if pin {
+            let cpus = cpus.clone();
+            b = b.start_handler(move |i| unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(cpus[i % cpus.len()], &mut set);
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            });
+        }
+        b.build_global().unwrap();
+    }
     #[cfg(target_arch = "x86_64")]
     USE512.store(is_x86_feature_detected!("avx512bw") && std::env::var_os("SS_NO512").is_none(), Relaxed);
     if !cfg!(feature = "profile") {
