@@ -1294,22 +1294,31 @@ fn hms(b: &[u8], i: usize) -> Option<i64> {
     Some(h * 3600 + m * 60 + s)
 }
 
-/// Per-chunk timestamp parser with a tiny cache of "YYYY-MM-DD" -> day number.
+/// Per-core timestamp parser with a cache of "YYYY-MM-DD" -> day number, one slot per
+/// (month, day) text, so the 20-30 dates of a dataset never evict each other.
 struct TsParser {
-    keys: [(u64, u16); 32],
-    days: [i64; 32], // i64::MIN = invalid date
+    keys: [(u64, u16); 1024],
+    days: [i64; 1024], // i64::MIN = invalid date
+}
+
+thread_local! {
+    static TSP: RefCell<TsParser> = const { RefCell::new(TsParser { keys: [(u64::MAX, u16::MAX); 1024], days: [0; 1024] }) };
 }
 
 impl TsParser {
     fn new() -> Self {
-        TsParser { keys: [(u64::MAX, u16::MAX); 32], days: [0; 32] }
+        TsParser { keys: [(u64::MAX, u16::MAX); 1024], days: [0; 1024] }
     }
 
     #[inline(always)]
     fn date(&mut self, b: &[u8]) -> Option<i64> {
         let k0 = load8(b, 0);
         let k1 = u16::from_le_bytes([b[8], b[9]]);
-        let slot = ((k0 ^ (k0 >> 29) ^ ((k1 as u64) << 7)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 59) as usize;
+        // Slot from the month and day digits (month 0-19 x 40 + day 0-39 < 1024): distinct dates
+        // of one year never share a slot; the full text is still compared.
+        let mo = (((k0 >> 40) as usize & 1) * 10) + ((k0 >> 48) as usize & 0x0F);
+        let dy = ((k1 as usize & 0x03) * 10) + ((k1 as usize >> 8) & 0x0F);
+        let slot = (mo * 40 + dy) & 1023;
         if self.keys[slot] != (k0, k1) {
             // Miss: the careful check of the date part, exactly as in parse_ts.
             let d = (|| {
@@ -1494,6 +1503,17 @@ impl SmallTab {
             }
         }
         t
+    }
+
+    /// Start loading the slot `get` will look at first.
+    #[inline(always)]
+    fn prefetch(&self, buf: &[u8], off: usize, len: usize) {
+        if len == 0 || len > 15 {
+            return;
+        }
+        let (lo, hi) = key16(buf, off, len);
+        let i = (mum(lo ^ 0x9E37_79B9_7F4A_7C15, hi ^ 0xD6E8_FEB8_6659_FD93) as usize) & self.mask;
+        prefetch(unsafe { self.tab.as_ptr().add(i) });
     }
 
     #[inline(always)]
@@ -2277,7 +2297,8 @@ fn main() {
                         std::hint::black_box(buf.len());
                         return;
                     }
-                    let mut tsp = TsParser::new();
+                    TSP.with(|tc| {
+                    let tsp = &mut *tc.borrow_mut();
                     scan_fields::<7>(buf, cs, ce, |fb| {
                         if exp == 2 {
                             std::hint::black_box(fb);
@@ -2297,6 +2318,10 @@ fn main() {
                         } else {
                             (key_of(buf, es, ee - es, None), None)
                         };
+                        // A purchase will look up its product: start loading that table slot now.
+                        if fb[4].1 - fb[4].0 == 8 {
+                            prod_tab.prefetch(buf, fb[5].0, fb[5].1 - fb[5].0);
+                        }
                         // Both timestamps together (shared date when they match).
                         let (ts_opt, ingest_opt) = if exp == 3 {
                             (Some(std::hint::black_box(ws + 1000)), Some(std::hint::black_box(ws + 5000)))
@@ -2359,6 +2384,7 @@ fn main() {
                         } else {
                             unsafe { gp.get_unchecked_mut(bk) }.push(EPur { em: r.em, uk: r.uk, ingest: r.ingest, ts: r.ts, pc });
                         }
+                    });
                     });
                 }));
             };
