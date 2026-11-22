@@ -1177,6 +1177,44 @@ mod diag {
         eprintln!("DIAG vmstat end: {}", vmstat(&keys));
     }
 
+    /// Re-run this program (without SS_DIAG) on the same data with 1, 2, 4 and 8 threads,
+    /// twice each, printing wall time and stage laps, plus the cgroup's CPU throttling counters
+    /// and CPU pressure around it: shows whether our threads scale on this machine.
+    pub fn scaling() {
+        show("cpu.stat before", "/sys/fs/cgroup/cpu.stat", 8, "");
+        show("cpu.pressure before", "/sys/fs/cgroup/cpu.pressure", 2, "");
+        let exe = std::env::current_exe().unwrap();
+        let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into());
+        for &nt in &[1usize, 2, 4, 8, 8, 4, 2, 1] {
+            let out = format!("{scratch}/diag_out_{nt}");
+            let _ = std::fs::remove_dir_all(&out);
+            let t = Instant::now();
+            let r = std::process::Command::new(&exe)
+                .env_remove("SS_DIAG")
+                .env("NCPU", nt.to_string())
+                .env("OUTPUT_DIR", &out)
+                .output();
+            let wall = t.elapsed().as_secs_f64();
+            match r {
+                Ok(o) => {
+                    let laps: Vec<String> = String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .filter_map(|l| {
+                            let v: Vec<&str> = l.split_whitespace().collect();
+                            if v.len() >= 3 && v[1].ends_with('s') { Some(format!("{} {}", v[2], v[1])) } else { None }
+                        })
+                        .collect();
+                    eprintln!("DIAG run NCPU={nt}: wall {wall:.3}s | {}", laps.join(" | "));
+                }
+                Err(e) => eprintln!("DIAG run NCPU={nt}: failed {e}"),
+            }
+            let _ = std::fs::remove_dir_all(&out);
+        }
+        show("cpu.stat after", "/sys/fs/cgroup/cpu.stat", 8, "");
+        show("cpu.pressure after", "/sys/fs/cgroup/cpu.pressure", 2, "");
+        show("loadavg", "/proc/loadavg", 1, "");
+    }
+
     pub fn environment() {
         show("cpu", "/proc/cpuinfo", 1, "model name");
         let flags = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
@@ -2268,6 +2306,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     if diag_on {
         diag::environment();
+        diag::scaling();
         diag::thp();
     }
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest");
