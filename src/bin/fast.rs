@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -487,6 +487,24 @@ thread_local! {
 // compiles away.
 static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10);
 static USE512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Diagnostic per-thread stats: chunks done and busy nanoseconds, events and clicks stages.
+static TS_EV_N: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+static TS_EV_NS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+static TS_CK_N: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+static TS_CK_NS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+#[inline]
+fn ts_add(n: &[AtomicU64; 32], ns: &[AtomicU64; 32], t: Instant) {
+    let i = rayon::current_thread_index().unwrap_or(31).min(31);
+    n[i].fetch_add(1, Relaxed);
+    ns[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+}
+fn ts_line(name: &str, n: &[AtomicU64; 32], ns: &[AtomicU64; 32]) -> String {
+    let parts: Vec<String> = (0..32)
+        .filter(|&i| n[i].load(Relaxed) > 0)
+        .map(|i| format!("{}:{}/{}", i, n[i].load(Relaxed), ns[i].load(Relaxed) / 1_000_000))
+        .collect();
+    format!("{name} {}", parts.join(" "))
+}
 /// AVX-512 compares on 256-bit registers (SS_VL=1): direct bit masks, no 512-bit clock penalty.
 static USEVL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EXP_G: AtomicU32 = AtomicU32::new(0);
@@ -1269,19 +1287,13 @@ mod diag {
             .output();
         eprintln!("DIAG generate 5M: {:.1}s ok={}", t.elapsed().as_secs_f64(), g.map(|o| o.status.success()).unwrap_or(false));
         let exe = std::env::current_exe().unwrap();
-        let runs: [(&str, &[(&str, &str)]); 12] = [
-            ("8t", &[("SS_THREADS", "8")]),
-            ("1t", &[("SS_THREADS", "1")]),
-            ("8t RO", &[("SS_THREADS", "8"), ("SS_RO", "1")]),
-            ("4t RO", &[("SS_THREADS", "4"), ("SS_RO", "1")]),
-            ("1t RO", &[("SS_THREADS", "1"), ("SS_RO", "1")]),
-            ("8t PRE", &[("SS_THREADS", "8"), ("SS_PRELOAD", "1")]),
-            ("4t PRE", &[("SS_THREADS", "4"), ("SS_PRELOAD", "1")]),
-            ("1t PRE", &[("SS_THREADS", "1"), ("SS_PRELOAD", "1")]),
-            ("8t PRE RO", &[("SS_THREADS", "8"), ("SS_PRELOAD", "1"), ("SS_RO", "1")]),
-            ("1t PRE RO", &[("SS_THREADS", "1"), ("SS_PRELOAD", "1"), ("SS_RO", "1")]),
-            ("8t", &[("SS_THREADS", "8")]),
-            ("4t", &[("SS_THREADS", "4")]),
+        let runs: [(&str, &[(&str, &str)]); 6] = [
+            ("8t", &[("SS_THREADS", "8"), ("SS_TSTAT", "1")]),
+            ("4t", &[("SS_THREADS", "4"), ("SS_TSTAT", "1")]),
+            ("1t", &[("SS_THREADS", "1"), ("SS_TSTAT", "1")]),
+            ("8t ml1", &[("SS_THREADS", "8"), ("SS_TSTAT", "1"), ("SS_ML1", "1")]),
+            ("8t nopin", &[("SS_THREADS", "8"), ("SS_TSTAT", "1"), ("SS_NO_PIN", "1")]),
+            ("8t", &[("SS_THREADS", "8"), ("SS_TSTAT", "1")]),
         ];
         for (name, envs) in runs.iter() {
             let out = format!("{scratch}/diag_out");
@@ -1303,6 +1315,11 @@ mod diag {
                     })
                     .collect();
                 eprintln!("DIAG {name}: {wall:.3} | {}", laps.join(" "));
+                for l in String::from_utf8_lossy(&o.stderr).lines() {
+                    if l.starts_with("EVT") || l.starts_with("CKT") {
+                        eprintln!("  {l}");
+                    }
+                }
             }
         }
     }
@@ -2835,7 +2852,17 @@ fn main() {
             #[cfg(not(windows))]
             let ordered = false;
             if !ordered {
-                ev_chunks.par_iter().for_each(|c| with_chunk(c, &mut |buf, cs, ce| do_chunk(buf, cs, ce)));
+                let ml1 = std::env::var_os("SS_ML1").is_some();
+                let ev_one = |c: &Chunk| {
+                    let t = Instant::now();
+                    with_chunk(c, &mut |buf, cs, ce| do_chunk(buf, cs, ce));
+                    ts_add(&TS_EV_N, &TS_EV_NS, t);
+                };
+                if ml1 {
+                    ev_chunks.par_iter().with_max_len(1).for_each(ev_one);
+                } else {
+                    ev_chunks.par_iter().for_each(ev_one);
+                }
             }
             (stage1.into_inner(), stage1p.into_inner())
         },
@@ -2975,7 +3002,8 @@ fn main() {
     // at the end of the stage.
     let ck_chunks = make_chunks_sized(sizes, ne..ne + nc, CK_CHUNK);
     let pck: PerThread<PCk> = PerThread::new(nt, npb, (ck_bytes / 45 / npb / nt) * 5 / 4 + 16);
-    ck_chunks.par_iter().for_each(|c| {
+    let ck_one = |c: &Chunk| {
+        let tck = Instant::now();
         pck.with(|g| CSCR.with(|cs_| with_chunk(c, &mut |buf, s0, e0| {
             let mut local = cs_.borrow_mut();
             local.clear();
@@ -3010,7 +3038,13 @@ fn main() {
                 unsafe { g.get_unchecked_mut((r.pk.mix() >> (64 - PB)) as usize) }.push(r);
             }
         })));
-    });
+        ts_add(&TS_CK_N, &TS_CK_NS, tck);
+    };
+    if std::env::var_os("SS_ML1").is_some() {
+        ck_chunks.par_iter().with_max_len(1).for_each(ck_one);
+    } else {
+        ck_chunks.par_iter().for_each(ck_one);
+    }
     let pck = pck.into_inner();
     lap(&format!("clicks ({ck_chunk_count} chunks)"));
 
@@ -3381,6 +3415,10 @@ fn main() {
         });
     });
     lap("write");
+    if std::env::var_os("SS_TSTAT").is_some() {
+        eprintln!("{}", ts_line("EVT", &TS_EV_N, &TS_EV_NS));
+        eprintln!("{}", ts_line("CKT", &TS_CK_N, &TS_CK_NS));
+    }
     #[cfg(target_os = "linux")]
     if diag_on {
         eprintln!("DIAG done: failing on purpose so the dev-set logs are shown");
