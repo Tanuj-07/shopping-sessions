@@ -1254,7 +1254,7 @@ mod diag {
             .output();
         eprintln!("DIAG generate 5M: {:.1}s ok={}", t.elapsed().as_secs_f64(), g.map(|o| o.status.success()).unwrap_or(false));
         let exe = std::env::current_exe().unwrap();
-        let runs: [(&str, &[(&str, &str)]); 12] = [
+        let runs: [(&str, &[(&str, &str)]); 13] = [
             ("8t", &[("SS_THREADS", "8")]),
             ("1t", &[("SS_THREADS", "1")]),
             ("2t", &[("SS_THREADS", "2")]),
@@ -1262,6 +1262,7 @@ mod diag {
             ("6t", &[("SS_THREADS", "6")]),
             ("8t nopin", &[("SS_THREADS", "8"), ("SS_NO_PIN", "1")]),
             ("8t no512", &[("SS_THREADS", "8"), ("SS_NO512", "1")]),
+            ("8t vl", &[("SS_THREADS", "8"), ("SS_VL", "1")]),
             ("4t no512", &[("SS_THREADS", "4"), ("SS_NO512", "1")]),
             ("8t nommap", &[("SS_THREADS", "8"), ("SS_NO_MMAP", "1")]),
             ("8t nothp", &[("SS_THREADS", "8"), ("SS_NO_THP", "1")]),
