@@ -898,6 +898,197 @@ mod zc {
     }
 }
 
+/// Windows: event chunks read straight from the disk into our buffers (unbuffered, overlapped
+/// reads, so the OS copies nothing), in chunk order and 2 x cores reads ahead of the parsing
+/// cores. Any chunk this cannot serve (a read error, a line longer than the read-ahead margin)
+/// goes through the normal copying path.
+#[cfg(windows)]
+mod uio {
+    use super::{Chunk, EXTRA};
+    use memchr::memchr;
+    use std::cell::UnsafeCell;
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering::*};
+    use std::sync::OnceLock;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: *mut c_void,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(name: *const u16, access: u32, share: u32, sec: *mut c_void, disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+        fn ReadFile(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut Overlapped) -> i32;
+        fn GetOverlappedResult(h: *mut c_void, ov: *mut Overlapped, n: *mut u32, wait: i32) -> i32;
+        fn CreateEventW(sa: *mut c_void, manual: i32, initial: i32, name: *const u16) -> *mut c_void;
+        fn GetLastError() -> u32;
+    }
+
+    const ALIGN: usize = 4096;
+    const ERROR_IO_PENDING: u32 = 997;
+
+    struct Slot {
+        buf: *mut u8,
+        ov: UnsafeCell<Overlapped>,
+        // Written by the issuing core before `issued` is published, read after.
+        h: UnsafeCell<*mut c_void>,
+        a0: UnsafeCell<usize>,
+        ok: UnsafeCell<bool>,
+        issued: AtomicUsize, // 1 + index of the chunk whose read was started in this slot
+    }
+    unsafe impl Sync for Slot {}
+    unsafe impl Send for Slot {}
+
+    /// Parse every chunk with `parse(buf, start, end)` over its whole lines. Returns false (and
+    /// does nothing) when this reader is switched off.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_ordered(
+        paths: &[PathBuf],
+        sizes: &[usize],
+        chunks: &[Chunk],
+        nt: usize,
+        parse: &(dyn Fn(&[u8], usize, usize) + Sync),
+        fallback: &(dyn Fn(&Chunk, &mut dyn FnMut(&[u8], usize, usize)) + Sync),
+    ) -> bool {
+        if std::env::var_os("SS_NO_UIO").is_some() || chunks.is_empty() {
+            return false;
+        }
+        let n = chunks.len();
+        let k = (std::env::var("SS_UIO_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2) * nt).clamp(2, n.max(2));
+        let span = |c: &Chunk| -> (usize, usize) {
+            let a0 = (c.start.max(1) - 1) & !(ALIGN - 1);
+            let a1 = ((c.end + EXTRA).min(sizes[c.file]) + ALIGN - 1) & !(ALIGN - 1);
+            (a0, a1 - a0)
+        };
+        let cap = chunks.iter().map(|c| span(c).1).max().unwrap() + ALIGN;
+        let handles: Vec<OnceLock<usize>> = (0..paths.len()).map(|_| OnceLock::new()).collect();
+        let open = |f: usize| -> *mut c_void {
+            *handles[f].get_or_init(|| {
+                let w: Vec<u16> = paths[f].as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+                // GENERIC_READ; share read+write; OPEN_EXISTING; NO_BUFFERING | OVERLAPPED
+                unsafe { CreateFileW(w.as_ptr(), 0x8000_0000, 3, std::ptr::null_mut(), 3, 0x2000_0000 | 0x4000_0000, std::ptr::null_mut()) as usize }
+            }) as *mut c_void
+        };
+        let slots: Vec<Slot> = (0..k)
+            .map(|_| {
+                let layout = std::alloc::Layout::from_size_align(cap, ALIGN).unwrap();
+                let buf = unsafe { std::alloc::alloc(layout) };
+                assert!(!buf.is_null(), "out of memory");
+                let ev = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+                Slot {
+                    buf,
+                    ov: UnsafeCell::new(Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, h_event: ev }),
+                    h: UnsafeCell::new(std::ptr::null_mut()),
+                    a0: UnsafeCell::new(0),
+                    ok: UnsafeCell::new(false),
+                    issued: AtomicUsize::new(0),
+                }
+            })
+            .collect();
+        // Start the read of chunk j into its slot (whose previous chunk is fully parsed).
+        let issue = |j: usize| {
+            let sl = &slots[j % k];
+            let c = &chunks[j];
+            let (a0, len) = span(c);
+            unsafe {
+                let h = open(c.file);
+                let ov = &mut *sl.ov.get();
+                ov.internal = 0;
+                ov.internal_high = 0;
+                ov.offset = a0 as u32;
+                ov.offset_high = (a0 >> 32) as u32;
+                let ok = !ov.h_event.is_null()
+                    && h as isize != -1
+                    && !h.is_null()
+                    && (ReadFile(h, sl.buf as *mut c_void, len as u32, std::ptr::null_mut(), ov) != 0 || GetLastError() == ERROR_IO_PENDING);
+                *sl.h.get() = h;
+                *sl.a0.get() = a0;
+                *sl.ok.get() = ok;
+            }
+            sl.issued.store(j + 1, Release);
+        };
+        for j in 0..k.min(n) {
+            issue(j);
+        }
+        let next = AtomicUsize::new(0);
+        rayon::scope(|sc| {
+            for _ in 0..nt {
+                sc.spawn(|_| loop {
+                    let j = next.fetch_add(1, Relaxed);
+                    if j >= n {
+                        break;
+                    }
+                    let sl = &slots[j % k];
+                    let c = &chunks[j];
+                    let mut spins = 0u32;
+                    while sl.issued.load(Acquire) != j + 1 {
+                        spins += 1;
+                        if spins < 256 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    let (h, a0, ok) = unsafe { (*sl.h.get(), *sl.a0.get(), *sl.ok.get()) };
+                    let mut got: u32 = 0;
+                    let ok = ok && unsafe { GetOverlappedResult(h, sl.ov.get(), &mut got, 1) != 0 };
+                    let mut done = false;
+                    if ok {
+                        // The chunk's whole lines, exactly as `load_chunk` finds them.
+                        let buf = unsafe { std::slice::from_raw_parts(sl.buf as *const u8, cap) };
+                        let got = got as usize;
+                        let size = sizes[c.file];
+                        let rel0 = c.start.max(1) - 1 - a0;
+                        if rel0 < got {
+                            match memchr(b'\n', &buf[rel0..got]) {
+                                None => done = true, // no line starts inside this chunk
+                                Some(i) => {
+                                    let first = rel0 + i + 1;
+                                    if a0 + first >= c.end {
+                                        done = true;
+                                    } else {
+                                        let from = c.end - 1 - a0;
+                                        if from < got {
+                                            match memchr(b'\n', &buf[from..got]) {
+                                                Some(i2) => {
+                                                    parse(buf, first, from + i2 + 1);
+                                                    done = true;
+                                                }
+                                                None if a0 + got >= size => {
+                                                    parse(buf, first, got);
+                                                    done = true;
+                                                }
+                                                None => {} // a very long last line: copying path
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !done {
+                        fallback(c, &mut |b, s0, e0| parse(b, s0, e0));
+                    }
+                    if j + k < n {
+                        issue(j + k);
+                    }
+                    // Let this core pick up other pending pool work (the linked-ID tasks run
+                    // alongside the parse and would otherwise wait for a free core).
+                    let _ = rayon::yield_now();
+                });
+            }
+        });
+        true
+    }
+}
+
 /// Zero-copy variant of `load_chunk` over a mapped file. Returns None when the chunk needs
 /// the copying path: its lines run too close to the end of the file for the parsers' 16-byte
 /// over-reads, or it holds no line start.
@@ -2068,8 +2259,8 @@ fn main() {
             let ev_chunks = make_chunks(sizes, 0..ne);
             let stage1: PerThread<ERaw> = PerThread::new(nt, neb, reserve);
             let stage1p: PerThread<EPur> = PerThread::new(nt, neb, 0);
-            ev_chunks.par_iter().for_each(|c| {
-                stage1.with(|g| stage1p.with(|gp| with_chunk(c, &mut |buf, cs, ce| {
+            let do_chunk = |buf: &[u8], cs: usize, ce: usize| {
+                stage1.with(|g| stage1p.with(|gp| {
                     if exp == 4 {
                         std::hint::black_box(buf.len());
                         return;
@@ -2157,8 +2348,15 @@ fn main() {
                             unsafe { gp.get_unchecked_mut(bk) }.push(EPur { em: r.em, uk: r.uk, ingest: r.ingest, ts: r.ts, pc });
                         }
                     });
-                })));
-            });
+                }));
+            };
+            #[cfg(windows)]
+            let ordered = uio::run_ordered(paths, sizes, &ev_chunks, nt, &do_chunk, &with_chunk);
+            #[cfg(not(windows))]
+            let ordered = false;
+            if !ordered {
+                ev_chunks.par_iter().for_each(|c| with_chunk(c, &mut |buf, cs, ce| do_chunk(buf, cs, ce)));
+            }
             (stage1.into_inner(), stage1p.into_inner())
         },
     );
