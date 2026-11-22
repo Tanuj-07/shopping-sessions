@@ -101,7 +101,25 @@ mod hugealloc {
     pub struct Huge;
     const BIG: usize = 4 << 20;
     const HP: usize = 2 << 20;
+    /// SS_NO_THP=1 turns huge-page advice off. On a long-running host with fragmented memory,
+    /// `defrag=madvise` makes every advised fault compact memory synchronously (a stall).
+    fn enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        static ON: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 on, 2 off
+        match ON.load(Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("SS_NO_THP").is_none();
+                ON.store(if on { 1 } else { 2 }, Relaxed);
+                on
+            }
+        }
+    }
     unsafe fn advise(p: *mut u8, size: usize) {
+        if !enabled() {
+            return;
+        }
         let start = (p as usize + HP - 1) & !(HP - 1);
         let end = (p as usize + size) & !(HP - 1);
         if end > start {
