@@ -487,6 +487,8 @@ thread_local! {
 // compiles away.
 static SLAB_SZ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 10);
 static USE512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// AVX-512 compares on 256-bit registers (SS_VL=1): direct bit masks, no 512-bit clock penalty.
+static USEVL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EXP_G: AtomicU32 = AtomicU32::new(0);
 static PF_G: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32);
 
@@ -522,6 +524,7 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2") {
             let use512 = USE512.load(Relaxed);
+            let usevl = USEVL.load(Relaxed);
             SIDX.with(|ix| {
                 let mut ix = ix.borrow_mut();
                 let (seps, nls, qs, qa, qb) = &mut *ix;
@@ -541,7 +544,9 @@ fn scan_fields<const N: usize>(buf: &[u8], s: usize, e: usize, mut f: impl FnMut
                         }
                     };
                     unsafe {
-                        if use512 {
+                        if usevl {
+                            index_slab_avx512vl(buf, p, q, seps, nls, qs, qa, qb)
+                        } else if use512 {
                             index_slab_avx512(buf, p, q, seps, nls, qs, qa, qb)
                         } else {
                             index_slab_avx2(buf, p, q, seps, nls, qs, qa, qb)
@@ -589,6 +594,22 @@ unsafe fn masks_avx2(ptr: *const u8) -> (u64, u64, u64) {
         let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64;
         let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64;
         lo | (hi << 32)
+    };
+    (mask(b'\n'), mask(b','), mask(b'"'))
+}
+
+/// Same masks with AVX-512 compares on 256-bit registers: the compare writes a bit mask
+/// directly (no movemask), and 256-bit registers avoid the 512-bit frequency license.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl")]
+#[inline]
+unsafe fn masks_avx512vl(ptr: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(ptr as *const __m256i);
+    let b = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
+    let mask = |c: u8| -> u64 {
+        let v = _mm256_set1_epi8(c as i8);
+        (_mm256_cmpeq_epi8_mask(a, v) as u64) | ((_mm256_cmpeq_epi8_mask(b, v) as u64) << 32)
     };
     (mask(b'\n'), mask(b','), mask(b'"'))
 }
@@ -732,6 +753,7 @@ macro_rules! define_index_slab {
 }
 define_index_slab!(index_slab_avx2, "avx2,bmi2", masks_avx2);
 define_index_slab!(index_slab_avx512, "avx2,bmi2,avx512f,avx512bw", masks_avx512);
+define_index_slab!(index_slab_avx512vl, "avx2,bmi2,avx512f,avx512bw,avx512vl", masks_avx512vl);
 
 /// Pass 2: walk the lines. A line is well-formed exactly when its N-th separator is its newline.
 /// Quoting is decided per line with bit operations: field i starts with a quote iff a quote
@@ -2093,6 +2115,10 @@ fn main() {
     }
     #[cfg(target_arch = "x86_64")]
     USE512.store(is_x86_feature_detected!("avx512bw") && std::env::var_os("SS_NO512").is_none(), Relaxed);
+    USEVL.store(
+        is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") && std::env::var_os("SS_VL").is_some(),
+        Relaxed,
+    );
     if !cfg!(feature = "profile") {
         // knobs below are profiling-only
     } else if let Some(v) = std::env::var("SS_PF").ok().and_then(|s| s.parse::<usize>().ok()) {
