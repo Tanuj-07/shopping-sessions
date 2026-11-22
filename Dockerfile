@@ -13,4 +13,6 @@ RUN sh pgo-build.sh
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/fast /app/fast
+# AVX-512 compares on 256-bit registers (test: avoids the 512-bit clock penalty).
+ENV SS_VL=1
 CMD ["/app/fast"]
