@@ -853,6 +853,28 @@ fn make_chunks(sizes: &[usize], files: std::ops::Range<usize>) -> Vec<Chunk> {
     make_chunks_sized(sizes, files, CHUNK)
 }
 
+/// Run `f` on every chunk with all pool threads pulling the next chunk index from one shared
+/// counter (no idle thread while chunks remain). SS_DYN=1 selects it over rayon's splitting.
+fn for_each_chunk(chunks: &[Chunk], f: &(dyn Fn(&Chunk) + Sync)) {
+    if std::env::var_os("SS_DYN").is_none() {
+        chunks.par_iter().for_each(|c| f(c));
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let nt = rayon::current_num_threads();
+    rayon::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|_| loop {
+                let j = next.fetch_add(1, Relaxed);
+                if j >= chunks.len() {
+                    break;
+                }
+                f(&chunks[j]);
+            });
+        }
+    });
+}
+
 fn make_chunks_sized(sizes: &[usize], files: std::ops::Range<usize>, chunk: usize) -> Vec<Chunk> {
     let mut out = Vec::new();
     for f in files {
@@ -926,7 +948,30 @@ mod zc {
     }
 
     /// Ask the kernel to map [from, to) of the file now (whole pages).
+    /// SS_NOPOP=1 skips the per-chunk populate (pages then fault in as they are read);
+    /// SS_POPALL=1 populates each whole file once when it is mapped instead.
+    pub fn per_chunk_populate() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        static S: AtomicU8 = AtomicU8::new(0);
+        match S.load(Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("SS_NOPOP").is_none() && std::env::var_os("SS_POPALL").is_none();
+                S.store(if on { 1 } else { 2 }, Relaxed);
+                on
+            }
+        }
+    }
+
     pub fn populate(m: &Map, from: usize, to: usize) {
+        if !per_chunk_populate() {
+            return;
+        }
+        populate_now(m, from, to);
+    }
+
+    pub fn populate_now(m: &Map, from: usize, to: usize) {
         const MADV_POPULATE_READ: libc::c_int = 22;
         let page = 4096;
         let a = from & !(page - 1);
@@ -2150,7 +2195,22 @@ fn main() {
     let ev_bytes: usize = sizes[..ne].iter().sum();
     let ck_bytes: usize = sizes[ne..ne + nc].iter().sum();
     #[cfg(target_os = "linux")]
-    let maps: Vec<Option<zc::Map>> = paths.par_iter().zip(sizes.par_iter()).map(|(p, &n)| zc::map(p, n)).collect();
+    let maps: Vec<Option<zc::Map>> = {
+        let popall = std::env::var_os("SS_POPALL").is_some();
+        paths
+            .par_iter()
+            .zip(sizes.par_iter())
+            .map(|(p, &n)| {
+                let m = zc::map(p, n);
+                if popall {
+                    if let Some(m) = &m {
+                        zc::populate_now(m, 0, m.len);
+                    }
+                }
+                m
+            })
+            .collect()
+    };
     // Run `f(buf, start, end)` over the whole lines of chunk `c`: straight from the mapped file
     // on Linux, otherwise (and for each file's last lines) in this core's reused buffer.
     let with_chunk = |c: &Chunk, f: &mut dyn FnMut(&[u8], usize, usize)| {
@@ -2465,7 +2525,7 @@ fn main() {
             #[cfg(not(windows))]
             let ordered = false;
             if !ordered {
-                ev_chunks.par_iter().for_each(|c| with_chunk(c, &mut |buf, cs, ce| do_chunk(buf, cs, ce)));
+                for_each_chunk(&ev_chunks, &|c| with_chunk(c, &mut |buf, cs, ce| do_chunk(buf, cs, ce)));
             }
             (stage1.into_inner(), stage1p.into_inner())
         },
@@ -2605,7 +2665,7 @@ fn main() {
     // at the end of the stage.
     let ck_chunks = make_chunks_sized(sizes, ne..ne + nc, CK_CHUNK);
     let pck: PerThread<PCk> = PerThread::new(nt, npb, (ck_bytes / 45 / npb / nt) * 5 / 4 + 16);
-    ck_chunks.par_iter().for_each(|c| {
+    for_each_chunk(&ck_chunks, &|c| {
         pck.with(|g| CSCR.with(|cs_| with_chunk(c, &mut |buf, s0, e0| {
             let mut local = cs_.borrow_mut();
             local.clear();
