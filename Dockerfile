@@ -13,4 +13,6 @@ RUN sh pgo-build.sh
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/fast /app/fast
+# AVX2 scanner instead of AVX-512 (test: on the scorer the AVX-512 stages did not scale past 4 threads).
+ENV SS_NO512=1
 CMD ["/app/fast"]
