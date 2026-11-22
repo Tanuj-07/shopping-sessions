@@ -13,4 +13,6 @@ RUN sh pgo-build.sh
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/fast /app/fast
+# No huge-page advice and no AVX-512 scanner (test).
+ENV SS_NO_THP=1 SS_NO512=1
 CMD ["/app/fast"]
