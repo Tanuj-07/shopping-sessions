@@ -2228,7 +2228,17 @@ fn main() {
             // Union so that each root is the person's byte-wise smallest id.
             let less = |a: u32, b: u32| cmp_keys(ids_ref[a as usize], ids_ref[b as usize], reg) == Ordering::Less;
             edges.par_iter().for_each(|v| {
-                for &(ka, kb) in v {
+                // Ask for both ends' table entries 16 links ahead (the table is far bigger than
+                // the cache, and these lookups otherwise wait on memory one by one).
+                for &(ka, kb) in v.iter().take(16) {
+                    pmap.prefetch(ka);
+                    pmap.prefetch(kb);
+                }
+                for (i, &(ka, kb)) in v.iter().enumerate() {
+                    if let Some(&(pa, pb)) = v.get(i + 16) {
+                        pmap.prefetch(pa);
+                        pmap.prefetch(pb);
+                    }
                     let mut a = pmap.get(ka).0 as u32;
                     let mut b = pmap.get(kb).0 as u32;
                     loop {
