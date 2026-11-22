@@ -1232,8 +1232,10 @@ mod diag {
             .output();
         eprintln!("DIAG generate 5M: {:.1}s ok={}", t.elapsed().as_secs_f64(), g.map(|o| o.status.success()).unwrap_or(false));
         let exe = std::env::current_exe().unwrap();
-        let runs: [(&str, &[(&str, &str)]); 10] = [
+        let runs: [(&str, &[(&str, &str)]); 12] = [
             ("8t", &[("SS_THREADS", "8")]),
+            ("1t", &[("SS_THREADS", "1")]),
+            ("2t", &[("SS_THREADS", "2")]),
             ("4t", &[("SS_THREADS", "4")]),
             ("6t", &[("SS_THREADS", "6")]),
             ("8t nopin", &[("SS_THREADS", "8"), ("SS_NO_PIN", "1")]),
@@ -1266,6 +1268,67 @@ mod diag {
                 eprintln!("DIAG {name}: {wall:.3} | {}", laps.join(" "));
             }
         }
+    }
+
+    /// Machine micro-benchmarks, one compact line each.
+    pub fn micro() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        // memory bandwidth: 8 threads each sum their own 256 MB (pre-touched)
+        let bufs: Vec<Vec<u64>> = (0..8).map(|_| vec![1u64; 32 << 20]).collect();
+        let t = Instant::now();
+        let tot = AtomicU64::new(0);
+        std::thread::scope(|sc| {
+            for b in &bufs {
+                let tot = &tot;
+                sc.spawn(move || {
+                    let s: u64 = b.iter().fold(0u64, |a, &x| a.wrapping_add(x));
+                    tot.fetch_add(s, Relaxed);
+                });
+            }
+        });
+        let dt = t.elapsed().as_secs_f64();
+        let bw8 = (8u64 << 28) as f64 / 1e9 / dt;
+        let t = Instant::now();
+        let s1: u64 = bufs[0].iter().fold(0u64, |a, &x| a.wrapping_add(x));
+        let bw1 = (1u64 << 28) as f64 / 1e9 / t.elapsed().as_secs_f64();
+        drop(bufs);
+        // random access latency: pointer chase over 256 MB
+        let n = 32usize << 20;
+        let mut next: Vec<u32> = (0..n as u32).collect();
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        for i in (1..n).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            next.swap(i, (x % (i as u64)) as usize);
+        }
+        let t = Instant::now();
+        let mut p = 0u32;
+        for _ in 0..2_000_000 {
+            p = next[p as usize];
+        }
+        let lat = t.elapsed().as_secs_f64() / 2e6 * 1e9;
+        drop(next);
+        // fresh-memory faults: 8 threads x 128 MB, with and without huge-page advice
+        let mut fault = String::new();
+        for huge in [false, true] {
+            let t = Instant::now();
+            std::thread::scope(|sc| {
+                for _ in 0..8 {
+                    sc.spawn(move || touch(128, huge));
+                }
+            });
+            fault += &format!(" huge={huge} {:.2}GB/s", 1.0 / t.elapsed().as_secs_f64());
+        }
+        // waking 8 pool threads: rayon broadcast round trips
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        pool.broadcast(|_| ());
+        let t = Instant::now();
+        for _ in 0..2000 {
+            pool.broadcast(|_| ());
+        }
+        let wake = t.elapsed().as_secs_f64() / 2000.0 * 1e6;
+        eprintln!("DIAG micro: bw 1t {bw1:.1}GB/s 8t {bw8:.1}GB/s | rand lat {lat:.0}ns | faults 8x128MB{fault} | wake8 {wake:.1}us | ({} {})", s1 & 1, p & 1);
     }
 
     pub fn environment() {
@@ -2368,6 +2431,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     if diag_on {
         show_cpu_short();
+        diag::micro();
         diag::bigscale();
         eprintln!("DIAG done: failing on purpose so the dev-set logs are shown");
         std::process::exit(3);
