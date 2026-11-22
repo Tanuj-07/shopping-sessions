@@ -97,7 +97,8 @@ mod sampler {
 
 #[cfg(target_os = "linux")]
 mod hugealloc {
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{GlobalAlloc, Layout};
+    static MI: mimalloc::MiMalloc = mimalloc::MiMalloc;
     pub struct Huge;
     const BIG: usize = 4 << 20;
     const HP: usize = 2 << 20;
@@ -128,24 +129,24 @@ mod hugealloc {
     }
     unsafe impl GlobalAlloc for Huge {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = System.alloc(l);
+            let p = MI.alloc(l);
             if !p.is_null() && l.size() >= BIG {
                 advise(p, l.size());
             }
             p
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = System.alloc_zeroed(l);
+            let p = MI.alloc_zeroed(l);
             if !p.is_null() && l.size() >= BIG {
                 advise(p, l.size());
             }
             p
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            System.dealloc(p, l)
+            MI.dealloc(p, l)
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-            let q = System.realloc(p, l, new_size);
+            let q = MI.realloc(p, l, new_size);
             if !q.is_null() && new_size >= BIG {
                 advise(q, new_size);
             }

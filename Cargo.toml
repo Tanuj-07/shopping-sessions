@@ -21,6 +21,9 @@ memchr = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [features]
 # Profiling build: `cargo build --release --features profile` reads the SS_EXP / SS_SLAB / SS_PF
 # measurement switches. The normal (submitted) build compiles them out.
