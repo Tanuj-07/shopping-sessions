@@ -1215,6 +1215,59 @@ mod diag {
         show("loadavg", "/proc/loadavg", 1, "");
     }
 
+    /// Generate a 5M-event dataset with the official generator (copied into the image), then run
+    /// this program on it with several thread counts / switches, one compact line each.
+    pub fn bigscale() {
+        let gen_s = std::env::var("SS_GEN_BIN").unwrap_or_else(|_| "/app/generate".into());
+        let gen = gen_s.as_str();
+        if !std::path::Path::new(gen).exists() {
+            eprintln!("DIAG no generator in image");
+            return;
+        }
+        let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into());
+        let d = format!("{scratch}/gen5m");
+        let t = Instant::now();
+        let g = std::process::Command::new(gen)
+            .args(["--seed", "4242", "--events", "5000000", "--clicks", "1250000", "--output", &d])
+            .output();
+        eprintln!("DIAG generate 5M: {:.1}s ok={}", t.elapsed().as_secs_f64(), g.map(|o| o.status.success()).unwrap_or(false));
+        let exe = std::env::current_exe().unwrap();
+        let runs: [(&str, &[(&str, &str)]); 10] = [
+            ("8t", &[("SS_THREADS", "8")]),
+            ("4t", &[("SS_THREADS", "4")]),
+            ("6t", &[("SS_THREADS", "6")]),
+            ("8t nopin", &[("SS_THREADS", "8"), ("SS_NO_PIN", "1")]),
+            ("8t no512", &[("SS_THREADS", "8"), ("SS_NO512", "1")]),
+            ("4t no512", &[("SS_THREADS", "4"), ("SS_NO512", "1")]),
+            ("8t nommap", &[("SS_THREADS", "8"), ("SS_NO_MMAP", "1")]),
+            ("8t nothp", &[("SS_THREADS", "8"), ("SS_NO_THP", "1")]),
+            ("8t", &[("SS_THREADS", "8")]),
+            ("4t", &[("SS_THREADS", "4")]),
+        ];
+        for (name, envs) in runs.iter() {
+            let out = format!("{scratch}/diag_out");
+            let _ = std::fs::remove_dir_all(&out);
+            let mut c = std::process::Command::new(&exe);
+            c.env_remove("SS_DIAG").env("DATA_DIR", &d).env("OUTPUT_DIR", &out);
+            for (k, v) in envs.iter() {
+                c.env(k, v);
+            }
+            let t = Instant::now();
+            let r = c.output();
+            let wall = t.elapsed().as_secs_f64();
+            if let Ok(o) = r {
+                let laps: Vec<String> = String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .filter_map(|l| {
+                        let v: Vec<&str> = l.split_whitespace().collect();
+                        if v.len() >= 3 && v[1].ends_with('s') { Some(format!("{}{}", &v[2][..v[2].len().min(4)], v[1].trim_end_matches('s'))) } else { None }
+                    })
+                    .collect();
+                eprintln!("DIAG {name}: {wall:.3} | {}", laps.join(" "));
+            }
+        }
+    }
+
     pub fn environment() {
         show("cpu", "/proc/cpuinfo", 1, "model name");
         let flags = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
@@ -1307,6 +1360,12 @@ mod diag {
         let dt = t.elapsed().as_secs_f64();
         eprintln!("DIAG pread 1 thread (second, now cached): {} MB in {:.3}s = {:.2} GB/s", got >> 20, dt, got as f64 / 1e9 / dt);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn show_cpu_short() {
+    let c = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    eprintln!("DIAG {}", c.lines().find(|l| l.starts_with("model name")).unwrap_or(""));
 }
 
 /// Zero-copy variant of `load_chunk` over a mapped file. Returns None when the chunk needs
@@ -2308,9 +2367,10 @@ fn main() {
     let diag_on = std::env::var_os("SS_DIAG").is_some();
     #[cfg(target_os = "linux")]
     if diag_on {
-        diag::environment();
-        diag::scaling();
-        diag::thp();
+        show_cpu_short();
+        diag::bigscale();
+        eprintln!("DIAG done: failing on purpose so the dev-set logs are shown");
+        std::process::exit(3);
     }
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_value(&manifest, "window_start");
