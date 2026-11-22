@@ -912,6 +912,21 @@ mod zc {
     unsafe impl Send for Map {}
     unsafe impl Sync for Map {}
 
+    /// Diagnostic SS_PRELOAD: read the whole file into our own memory instead of mapping it.
+    pub fn load(path: &std::path::Path, len: usize) -> Option<Map> {
+        if len == 0 {
+            return None;
+        }
+        let mut v: Vec<u8> = Vec::with_capacity(len + 256);
+        let mut f = std::fs::File::open(path).ok()?;
+        use std::io::Read;
+        f.read_to_end(&mut v).ok()?;
+        v.resize(len + 256, 0);
+        let p = v.as_ptr();
+        std::mem::forget(v);
+        Some(Map { ptr: p, len })
+    }
+
     pub fn map(path: &std::path::Path, len: usize) -> Option<Map> {
         use std::os::unix::io::AsRawFd;
         if len == 0 || std::env::var_os("SS_NO_MMAP").is_some() {
@@ -1254,18 +1269,17 @@ mod diag {
             .output();
         eprintln!("DIAG generate 5M: {:.1}s ok={}", t.elapsed().as_secs_f64(), g.map(|o| o.status.success()).unwrap_or(false));
         let exe = std::env::current_exe().unwrap();
-        let runs: [(&str, &[(&str, &str)]); 13] = [
+        let runs: [(&str, &[(&str, &str)]); 12] = [
             ("8t", &[("SS_THREADS", "8")]),
             ("1t", &[("SS_THREADS", "1")]),
-            ("2t", &[("SS_THREADS", "2")]),
-            ("4t", &[("SS_THREADS", "4")]),
-            ("6t", &[("SS_THREADS", "6")]),
-            ("8t nopin", &[("SS_THREADS", "8"), ("SS_NO_PIN", "1")]),
-            ("8t no512", &[("SS_THREADS", "8"), ("SS_NO512", "1")]),
-            ("8t vl", &[("SS_THREADS", "8"), ("SS_VL", "1")]),
-            ("4t no512", &[("SS_THREADS", "4"), ("SS_NO512", "1")]),
-            ("8t nommap", &[("SS_THREADS", "8"), ("SS_NO_MMAP", "1")]),
-            ("8t nothp", &[("SS_THREADS", "8"), ("SS_NO_THP", "1")]),
+            ("8t RO", &[("SS_THREADS", "8"), ("SS_RO", "1")]),
+            ("4t RO", &[("SS_THREADS", "4"), ("SS_RO", "1")]),
+            ("1t RO", &[("SS_THREADS", "1"), ("SS_RO", "1")]),
+            ("8t PRE", &[("SS_THREADS", "8"), ("SS_PRELOAD", "1")]),
+            ("4t PRE", &[("SS_THREADS", "4"), ("SS_PRELOAD", "1")]),
+            ("1t PRE", &[("SS_THREADS", "1"), ("SS_PRELOAD", "1")]),
+            ("8t PRE RO", &[("SS_THREADS", "8"), ("SS_PRELOAD", "1"), ("SS_RO", "1")]),
+            ("1t PRE RO", &[("SS_THREADS", "1"), ("SS_PRELOAD", "1"), ("SS_RO", "1")]),
             ("8t", &[("SS_THREADS", "8")]),
             ("4t", &[("SS_THREADS", "4")]),
         ];
@@ -2488,13 +2502,31 @@ fn main() {
     let ev_bytes: usize = sizes[..ne].iter().sum();
     let ck_bytes: usize = sizes[ne..ne + nc].iter().sum();
     #[cfg(target_os = "linux")]
-    let maps: Vec<Option<zc::Map>> = paths.par_iter().zip(sizes.par_iter()).map(|(p, &n)| zc::map(p, n)).collect();
+    let preload = std::env::var_os("SS_PRELOAD").is_some();
+    #[cfg(target_os = "linux")]
+    let maps: Vec<Option<zc::Map>> = paths
+        .par_iter()
+        .zip(sizes.par_iter())
+        .map(|(p, &n)| if preload { zc::load(p, n) } else { zc::map(p, n) })
+        .collect();
+    let read_only = std::env::var_os("SS_RO").is_some();
     // Run `f(buf, start, end)` over the whole lines of chunk `c`: straight from the mapped file
     // on Linux, otherwise (and for each file's last lines) in this core's reused buffer.
     let with_chunk = |c: &Chunk, f: &mut dyn FnMut(&[u8], usize, usize)| {
         #[cfg(target_os = "linux")]
         if let Some(m) = &maps[c.file] {
             if let Some((s, e)) = mapped_chunk(m, c) {
+                if read_only {
+                    let d = unsafe { std::slice::from_raw_parts(m.ptr, m.len) };
+                    let mut x = 0u64;
+                    let mut i = s;
+                    while i < e {
+                        x = x.wrapping_add(d[i] as u64);
+                        i += 64;
+                    }
+                    std::hint::black_box(x);
+                    return;
+                }
                 f(unsafe { std::slice::from_raw_parts(m.ptr, m.len) }, s, e);
                 return;
             }
