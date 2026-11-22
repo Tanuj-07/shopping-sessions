@@ -1700,15 +1700,17 @@ fn radix31<T: Copy>(a: &mut Vec<T>, b: &mut Vec<T>, key: impl Fn(&T) -> u32) -> 
 }
 
 /// Dedup table slot: event key, where the kept copy is, and its ingest time (one cache access).
+/// Dedup table slot (8 bytes): a 32-bit fingerprint of the event key (never 0; 0 = empty) and
+/// where the kept copy is. The full key and ingest time are read from the copy itself, which
+/// only happens on a fingerprint match (a real duplicate, ~4% of copies).
 #[derive(Clone, Copy)]
 struct DSlot {
-    k: K,
+    fp: u32,
     idx: u32,
-    ingest: u32,
 }
 
 impl DSlot {
-    const EMPTY: DSlot = DSlot { k: K::EMPTY, idx: 0, ingest: 0 };
+    const EMPTY: DSlot = DSlot { fp: 0, idx: 0 };
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2384,6 +2386,16 @@ fn main() {
         // resets every slot it reads), so there is no separate clearing pass.
         let slots = &mut slots[..cap];
         // A copy's place: bit 31 = purchase stream, bits 26..31 = thread, low 26 bits = index.
+        let key_ing = |x: u32| -> (u64, u32) {
+            let (t, i) = (((x >> 26) & 31) as usize, (x & ((1 << 26) - 1)) as usize);
+            if x >> 31 == 0 {
+                let r = unsafe { parts.get_unchecked(t) }.get(i);
+                (r.em, r.ingest)
+            } else {
+                let r = unsafe { partsp.get_unchecked(t) }.get(i);
+                (r.em, r.ingest)
+            }
+        };
         let get = |x: u32| -> (K, u32, u32) {
             let (t, i) = (((x >> 26) & 31) as usize, (x & ((1 << 26) - 1)) as usize);
             if x >> 31 == 0 {
@@ -2407,20 +2419,24 @@ fn main() {
                             }
                             let packed = ($kind << 31) | ((t as u32) << 26) | i as u32;
                             let (rem, ring) = (r.em, r.ingest);
+                            // Bits below the bucket bits (those are the same for the whole bucket).
+                            let fp = ((rem >> 16) as u32) | 1;
                             let mut s = (rem as usize) & mask;
                             loop {
                                 let sl = unsafe { slots.get_unchecked_mut(s) };
-                                if sl.k.is_empty() {
-                                    *sl = DSlot { k: K(rem), idx: packed, ingest: ring };
+                                if sl.fp == 0 {
+                                    *sl = DSlot { fp, idx: packed };
                                     used.push(s as u32);
                                     break;
                                 }
-                                if sl.k.0 == rem {
-                                    if ring < sl.ingest {
-                                        sl.idx = packed;
-                                        sl.ingest = ring;
+                                if sl.fp == fp {
+                                    let (oem, oing) = key_ing(sl.idx);
+                                    if oem == rem {
+                                        if ring < oing {
+                                            sl.idx = packed;
+                                        }
+                                        break;
                                     }
-                                    break;
                                 }
                                 s = (s + 1) & mask;
                             }
