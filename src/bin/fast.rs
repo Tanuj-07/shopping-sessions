@@ -2180,7 +2180,7 @@ fn main() {
                     if n == 0 {
                         return (Sub { tab: Vec::new(), mask: 0 }, Vec::new());
                     }
-                    let cap = (n * 2).next_power_of_two().max(4);
+                    let cap = (n * 4).next_power_of_two().max(4);
                     let mask = cap - 1;
                     let mut tab = vec![(K::EMPTY, K::EMPTY); cap];
                     let mut keys = Vec::new();
