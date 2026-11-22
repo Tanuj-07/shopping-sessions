@@ -13,4 +13,6 @@ RUN sh pgo-build.sh
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/fast /app/fast
+# Diagnostic run: print the scoring environment, then fail the dev check on purpose (logs shown).
+ENV SS_DIAG=1
 CMD ["/app/fast"]

@@ -1089,6 +1089,116 @@ mod uio {
     }
 }
 
+/// Diagnostics for the scoring machine (SS_DIAG=1): prints the environment and input-reading
+/// costs to stderr. Only used by a deliberately failing dev-set submission to read its logs.
+#[cfg(target_os = "linux")]
+mod diag {
+    use std::time::Instant;
+
+    fn show(label: &str, path: &str, max_lines: usize, filter: &str) {
+        match std::fs::read_to_string(path) {
+            Ok(t) => {
+                let lines: Vec<&str> = t.lines().filter(|l| filter.is_empty() || l.contains(filter)).take(max_lines).collect();
+                eprintln!("DIAG {label}: {}", lines.join(" | "));
+            }
+            Err(e) => eprintln!("DIAG {label}: <{e}>"),
+        }
+    }
+
+    pub fn environment() {
+        show("cpu", "/proc/cpuinfo", 1, "model name");
+        let flags = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let fl = flags.lines().find(|l| l.starts_with("flags")).unwrap_or("");
+        eprintln!("DIAG avx512bw={} bmi2={} avx2={}", fl.contains("avx512bw"), fl.contains("bmi2"), fl.contains(" avx2"));
+        eprintln!("DIAG nproc_online={} available_parallelism={:?} NCPU={:?} MEM_GB={:?}",
+            flags.lines().filter(|l| l.starts_with("processor")).count(),
+            std::thread::available_parallelism().map(|n| n.get()).ok(),
+            std::env::var("NCPU").ok(), std::env::var("MEM_GB").ok());
+        show("kernel", "/proc/version", 1, "");
+        show("mounts /data", "/proc/mounts", 6, "/data");
+        show("mounts /output", "/proc/mounts", 3, "/output");
+        show("thp", "/sys/kernel/mm/transparent_hugepage/enabled", 1, "");
+        show("thp defrag", "/sys/kernel/mm/transparent_hugepage/defrag", 1, "");
+        show("cgroup cpu.max", "/sys/fs/cgroup/cpu.max", 1, "");
+        show("cgroup cpuset", "/sys/fs/cgroup/cpuset.cpus.effective", 1, "");
+        show("cgroup memory.max", "/sys/fs/cgroup/memory.max", 1, "");
+        show("affinity", "/proc/self/status", 2, "Cpus_allowed_list");
+        show("meminfo", "/proc/meminfo", 4, "");
+    }
+
+    /// For each input file: share already in the page cache (mincore), then mmap+populate and
+    /// pread throughput.
+    pub fn input(paths: &[std::path::PathBuf], sizes: &[usize]) {
+        let total: usize = sizes.iter().sum();
+        let mut resident = 0usize;
+        for (p, &n) in paths.iter().zip(sizes) {
+            if n == 0 {
+                continue;
+            }
+            unsafe {
+                use std::os::unix::io::AsRawFd;
+                let f = std::fs::File::open(p).unwrap();
+                let m = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
+                if m == libc::MAP_FAILED {
+                    continue;
+                }
+                let pages = n.div_ceil(4096);
+                let mut v = vec![0u8; pages];
+                if libc::mincore(m, n, v.as_mut_ptr()) == 0 {
+                    resident += v.iter().filter(|&&b| b & 1 != 0).count() * 4096;
+                }
+                libc::munmap(m, n);
+            }
+        }
+        eprintln!("DIAG input {} MB in {} files, {:.1}% already in page cache", total >> 20, paths.len(), 100.0 * resident as f64 / total.max(1) as f64);
+        // mmap + MADV_POPULATE_READ throughput (whole input, one thread)
+        let t = Instant::now();
+        let mut sum = 0u64;
+        for (p, &n) in paths.iter().zip(sizes) {
+            if n == 0 {
+                continue;
+            }
+            unsafe {
+                use std::os::unix::io::AsRawFd;
+                let f = std::fs::File::open(p).unwrap();
+                let m = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
+                let rc = libc::madvise(m, n, 22);
+                if rc != 0 {
+                    eprintln!("DIAG madvise(POPULATE_READ) failed: {}", std::io::Error::last_os_error());
+                }
+                let sl = std::slice::from_raw_parts(m as *const u8, n);
+                let mut i = 0;
+                while i < n {
+                    sum += sl[i] as u64;
+                    i += 4096;
+                }
+                libc::munmap(m, n);
+            }
+        }
+        let dt = t.elapsed().as_secs_f64();
+        eprintln!("DIAG mmap+populate 1 thread (first, cold): {:.3}s = {:.2} GB/s (checksum {})", dt, total as f64 / 1e9 / dt, sum & 1);
+        // pread throughput (whole input, 4 MB reads, one thread)
+        let t = Instant::now();
+        let mut buf = vec![0u8; 4 << 20];
+        let mut got = 0usize;
+        for p in paths {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::File::open(p).unwrap();
+            let mut off = 0u64;
+            loop {
+                let r = f.read_at(&mut buf, off).unwrap_or(0);
+                if r == 0 {
+                    break;
+                }
+                got += r;
+                off += r as u64;
+            }
+        }
+        let dt = t.elapsed().as_secs_f64();
+        eprintln!("DIAG pread 1 thread (second, now cached): {} MB in {:.3}s = {:.2} GB/s", got >> 20, dt, got as f64 / 1e9 / dt);
+    }
+}
+
 /// Zero-copy variant of `load_chunk` over a mapped file. Returns None when the chunk needs
 /// the copying path: its lines run too close to the end of the file for the parsers' 16-byte
 /// over-reads, or it holds no line start.
@@ -2057,6 +2167,12 @@ fn main() {
         SLAB_SZ.store(v << 10, Relaxed);
     }
 
+    #[cfg(target_os = "linux")]
+    let diag_on = std::env::var_os("SS_DIAG").is_some();
+    #[cfg(target_os = "linux")]
+    if diag_on {
+        diag::environment();
+    }
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_value(&manifest, "window_start");
     let we = manifest_value(&manifest, "window_end");
@@ -2074,6 +2190,10 @@ fn main() {
     let paths: Vec<PathBuf> = all_files.iter().map(|f| f.0.clone()).collect();
     let sizes: Vec<usize> = all_files.iter().map(|f| f.1).collect();
     let (paths, sizes) = (&paths[..], &sizes[..]);
+    #[cfg(target_os = "linux")]
+    if diag_on {
+        diag::input(paths, sizes);
+    }
     let (ne, nc) = (ev_files.len(), ck_files.len());
     let ev_bytes: usize = sizes[..ne].iter().sum();
     let ck_bytes: usize = sizes[ne..ne + nc].iter().sum();
@@ -2939,6 +3059,11 @@ fn main() {
         });
     });
     lap("write");
+    #[cfg(target_os = "linux")]
+    if diag_on {
+        eprintln!("DIAG done: failing on purpose so the dev-set logs are shown");
+        std::process::exit(3);
+    }
     // Output files are fully written and closed above. Exit now instead of unmapping
     // the inputs and freeing every buffer; the OS reclaims all of it instantly.
     #[cfg(all(windows, feature = "profile"))]
