@@ -871,6 +871,28 @@ fn make_chunks(sizes: &[usize], files: std::ops::Range<usize>) -> Vec<Chunk> {
     make_chunks_sized(sizes, files, CHUNK)
 }
 
+/// Run `f` on every chunk with all pool threads pulling the next chunk index from one shared
+/// counter (no idle thread while chunks remain). SS_DYN=1 selects it over rayon's splitting.
+fn for_each_chunk(chunks: &[Chunk], f: &(dyn Fn(&Chunk) + Sync)) {
+    if std::env::var_os("SS_DYN").is_none() {
+        chunks.par_iter().for_each(|c| f(c));
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let nt = rayon::current_num_threads();
+    rayon::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|_| loop {
+                let j = next.fetch_add(1, Relaxed);
+                if j >= chunks.len() {
+                    break;
+                }
+                f(&chunks[j]);
+            });
+        }
+    });
+}
+
 fn make_chunks_sized(sizes: &[usize], files: std::ops::Range<usize>, chunk: usize) -> Vec<Chunk> {
     let mut out = Vec::new();
     for f in files {
@@ -959,7 +981,30 @@ mod zc {
     }
 
     /// Ask the kernel to map [from, to) of the file now (whole pages).
+    /// SS_NOPOP=1 skips the per-chunk populate (pages then fault in as they are read);
+    /// SS_POPALL=1 populates each whole file once when it is mapped instead.
+    pub fn per_chunk_populate() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        static S: AtomicU8 = AtomicU8::new(0);
+        match S.load(Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("SS_NOPOP").is_none() && std::env::var_os("SS_POPALL").is_none();
+                S.store(if on { 1 } else { 2 }, Relaxed);
+                on
+            }
+        }
+    }
+
     pub fn populate(m: &Map, from: usize, to: usize) {
+        if !per_chunk_populate() {
+            return;
+        }
+        populate_now(m, from, to);
+    }
+
+    pub fn populate_now(m: &Map, from: usize, to: usize) {
         const MADV_POPULATE_READ: libc::c_int = 22;
         let page = 4096;
         let a = from & !(page - 1);
@@ -1287,13 +1332,17 @@ mod diag {
             .output();
         eprintln!("DIAG generate 5M: {:.1}s ok={}", t.elapsed().as_secs_f64(), g.map(|o| o.status.success()).unwrap_or(false));
         let exe = std::env::current_exe().unwrap();
-        let runs: [(&str, &[(&str, &str)]); 6] = [
+        let runs: [(&str, &[(&str, &str)]); 10] = [
             ("8t", &[("SS_THREADS", "8"), ("SS_TSTAT", "1")]),
-            ("4t", &[("SS_THREADS", "4"), ("SS_TSTAT", "1")]),
-            ("1t", &[("SS_THREADS", "1"), ("SS_TSTAT", "1")]),
-            ("8t ml1", &[("SS_THREADS", "8"), ("SS_TSTAT", "1"), ("SS_ML1", "1")]),
-            ("8t nopin", &[("SS_THREADS", "8"), ("SS_TSTAT", "1"), ("SS_NO_PIN", "1")]),
-            ("8t", &[("SS_THREADS", "8"), ("SS_TSTAT", "1")]),
+            ("1t", &[("SS_THREADS", "1")]),
+            ("8t nopop", &[("SS_THREADS", "8"), ("SS_NOPOP", "1"), ("SS_TSTAT", "1")]),
+            ("1t nopop", &[("SS_THREADS", "1"), ("SS_NOPOP", "1")]),
+            ("8t popall", &[("SS_THREADS", "8"), ("SS_POPALL", "1"), ("SS_TSTAT", "1")]),
+            ("8t nopop RO", &[("SS_THREADS", "8"), ("SS_NOPOP", "1"), ("SS_RO", "1")]),
+            ("1t nopop RO", &[("SS_THREADS", "1"), ("SS_NOPOP", "1"), ("SS_RO", "1")]),
+            ("8t dyn", &[("SS_THREADS", "8"), ("SS_DYN", "1")]),
+            ("8t popall dyn", &[("SS_THREADS", "8"), ("SS_POPALL", "1"), ("SS_DYN", "1")]),
+            ("8t", &[("SS_THREADS", "8")]),
         ];
         for (name, envs) in runs.iter() {
             let out = format!("{scratch}/diag_out");
@@ -2521,11 +2570,22 @@ fn main() {
     #[cfg(target_os = "linux")]
     let preload = std::env::var_os("SS_PRELOAD").is_some();
     #[cfg(target_os = "linux")]
-    let maps: Vec<Option<zc::Map>> = paths
-        .par_iter()
-        .zip(sizes.par_iter())
-        .map(|(p, &n)| if preload { zc::load(p, n) } else { zc::map(p, n) })
-        .collect();
+    let maps: Vec<Option<zc::Map>> = {
+        let popall = std::env::var_os("SS_POPALL").is_some();
+        paths
+            .par_iter()
+            .zip(sizes.par_iter())
+            .map(|(p, &n)| {
+                let m = if preload { zc::load(p, n) } else { zc::map(p, n) };
+                if popall {
+                    if let Some(m) = &m {
+                        zc::populate_now(m, 0, m.len);
+                    }
+                }
+                m
+            })
+            .collect()
+    };
     let read_only = std::env::var_os("SS_RO").is_some();
     // Run `f(buf, start, end)` over the whole lines of chunk `c`: straight from the mapped file
     // on Linux, otherwise (and for each file's last lines) in this core's reused buffer.
@@ -2852,17 +2912,12 @@ fn main() {
             #[cfg(not(windows))]
             let ordered = false;
             if !ordered {
-                let ml1 = std::env::var_os("SS_ML1").is_some();
                 let ev_one = |c: &Chunk| {
                     let t = Instant::now();
                     with_chunk(c, &mut |buf, cs, ce| do_chunk(buf, cs, ce));
                     ts_add(&TS_EV_N, &TS_EV_NS, t);
                 };
-                if ml1 {
-                    ev_chunks.par_iter().with_max_len(1).for_each(ev_one);
-                } else {
-                    ev_chunks.par_iter().for_each(ev_one);
-                }
+                for_each_chunk(&ev_chunks, &ev_one);
             }
             (stage1.into_inner(), stage1p.into_inner())
         },
@@ -3040,11 +3095,7 @@ fn main() {
         })));
         ts_add(&TS_CK_N, &TS_CK_NS, tck);
     };
-    if std::env::var_os("SS_ML1").is_some() {
-        ck_chunks.par_iter().with_max_len(1).for_each(ck_one);
-    } else {
-        ck_chunks.par_iter().for_each(ck_one);
-    }
+    for_each_chunk(&ck_chunks, &ck_one);
     let pck = pck.into_inner();
     lap(&format!("clicks ({ck_chunk_count} chunks)"));
 
