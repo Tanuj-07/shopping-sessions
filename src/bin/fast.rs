@@ -2196,20 +2196,23 @@ fn main() {
     let ck_bytes: usize = sizes[ne..ne + nc].iter().sum();
     #[cfg(target_os = "linux")]
     let maps: Vec<Option<zc::Map>> = {
-        let popall = std::env::var_os("SS_POPALL").is_some();
-        paths
-            .par_iter()
-            .zip(sizes.par_iter())
-            .map(|(p, &n)| {
-                let m = zc::map(p, n);
-                if popall {
-                    if let Some(m) = &m {
-                        zc::populate_now(m, 0, m.len);
-                    }
+        let maps: Vec<Option<zc::Map>> = paths.par_iter().zip(sizes.par_iter()).map(|(p, &n)| zc::map(p, n)).collect();
+        if std::env::var_os("SS_POPALL").is_some() {
+            // Populate every file up front, in 64 MB pieces spread over all threads.
+            const PIECE: usize = 64 << 20;
+            let pieces: Vec<(usize, usize)> = maps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| m.as_ref().map(|m| (i, m.len)))
+                .flat_map(|(i, len)| (0..len.div_ceil(PIECE)).map(move |k| (i, k * PIECE)))
+                .collect();
+            pieces.par_iter().with_max_len(1).for_each(|&(i, off)| {
+                if let Some(m) = &maps[i] {
+                    zc::populate_now(m, off, (off + PIECE).min(m.len));
                 }
-                m
-            })
-            .collect()
+            });
+        }
+        maps
     };
     // Run `f(buf, start, end)` over the whole lines of chunk `c`: straight from the mapped file
     // on Linux, otherwise (and for each file's last lines) in this core's reused buffer.
