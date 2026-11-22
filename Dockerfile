@@ -13,4 +13,6 @@ RUN sh pgo-build.sh
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/fast /app/fast
+# One worker per physical core (test: the scorer's hyperthreads did not help in diagnostics).
+ENV SS_THREADS=4
 CMD ["/app/fast"]
