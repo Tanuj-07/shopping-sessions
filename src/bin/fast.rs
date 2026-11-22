@@ -1123,6 +1123,59 @@ mod diag {
         }
     }
 
+    fn vmstat(keys: &[&str]) -> String {
+        let t = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+        keys.iter()
+            .map(|k| format!("{k}={}", t.lines().find(|l| l.split(' ').next() == Some(*k)).and_then(|l| l.split(' ').nth(1)).unwrap_or("?")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Touch `mb` MB of fresh memory, with or without huge-page advice; returns seconds.
+    fn touch(mb: usize, huge: bool) -> f64 {
+        let n = mb << 20;
+        unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) as *mut u8;
+            if huge {
+                libc::madvise(p as *mut libc::c_void, n, libc::MADV_HUGEPAGE);
+            }
+            let t = Instant::now();
+            let mut i = 0;
+            while i < n {
+                *p.add(i) = 1;
+                i += 4096;
+            }
+            let dt = t.elapsed().as_secs_f64();
+            libc::munmap(p as *mut libc::c_void, n);
+            dt
+        }
+    }
+
+    /// Huge pages on this host: cost of faulting memory in with and without the advice, and the
+    /// kernel's compaction counters around it.
+    pub fn thp() {
+        let keys = ["thp_fault_alloc", "thp_fault_fallback", "compact_stall", "compact_fail", "compact_success"];
+        show("buddyinfo", "/proc/buddyinfo", 4, "");
+        eprintln!("DIAG vmstat before: {}", vmstat(&keys));
+        for round in 0..2 {
+            let h = touch(512, true);
+            eprintln!("DIAG vmstat after huge #{round}: {}", vmstat(&keys));
+            let n = touch(512, false);
+            eprintln!("DIAG touch 512 MB round {round}: with huge-page advice {:.3}s, without {:.3}s", h, n);
+        }
+        // 8 threads at once, like the pipeline's allocation bursts
+        for huge in [true, false] {
+            let t = Instant::now();
+            std::thread::scope(|sc| {
+                for _ in 0..8 {
+                    sc.spawn(move || touch(128, huge));
+                }
+            });
+            eprintln!("DIAG 8 threads x 128 MB, huge={huge}: {:.3}s", t.elapsed().as_secs_f64());
+        }
+        eprintln!("DIAG vmstat end: {}", vmstat(&keys));
+    }
+
     pub fn environment() {
         show("cpu", "/proc/cpuinfo", 1, "model name");
         let flags = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
@@ -2190,6 +2243,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     if diag_on {
         diag::environment();
+        diag::thp();
     }
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_value(&manifest, "window_start");
