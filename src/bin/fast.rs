@@ -2247,8 +2247,11 @@ fn main() {
 
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    let nt: usize = std::env::var("NCPU")
+    // SS_THREADS (ours) takes precedence over NCPU (set by the scorer): lets a build choose its
+    // own worker count, e.g. one per physical core.
+    let nt: usize = std::env::var("SS_THREADS")
         .ok()
+        .or_else(|| std::env::var("NCPU").ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .clamp(1, 31);
