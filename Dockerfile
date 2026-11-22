@@ -13,4 +13,6 @@ RUN sh pgo-build.sh
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/fast /app/fast
+# Read input with plain reads instead of memory-mapping (test variant).
+ENV SS_NO_MMAP=1
 CMD ["/app/fast"]
